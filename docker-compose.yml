@@ -1,0 +1,75 @@
+version: '3.8'
+
+services:
+  # MySQL Database
+  db:
+    image: mysql:8.0
+    container_name: face-attendance-db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: face_attendance
+      MYSQL_USER: faceuser
+      MYSQL_PASSWORD: facepassword
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./database/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    ports:
+      - "3306:3306"
+    networks:
+      - face-attendance-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Backend API (Flask + Socket.IO)
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: face-attendance-api
+    restart: always
+    environment:
+      - DB_HOST=db
+      - DB_USER=faceuser
+      - DB_PASSWORD=facepassword
+      - DB_NAME=face_attendance
+      - SECRET_KEY=your-secret-key-change-in-production
+      - PORT=5001
+      - UPLOAD_FOLDER=/app/TrainingImage
+      - MODEL_PATH=/app/model/Trainer.yml
+      - CASCADE_PATH=/app/model/Haarcascade.xml
+    ports:
+      - "5001:5001"
+    volumes:
+      - ./TrainingImage:/app/TrainingImage
+      - ./model:/app/model
+      - ./logs:/app/logs
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - face-attendance-network
+
+  # Frontend (React + Nginx)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: face-attendance-web
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    networks:
+      - face-attendance-network
+
+volumes:
+  mysql_data:
+
+networks:
+  face-attendance-network:
+    driver: bridge

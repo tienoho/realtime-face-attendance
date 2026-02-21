@@ -26,6 +26,7 @@ class CameraManager:
         self.camera_configs = {}  # camera_id -> config
         self.frame_queues = {}  # camera_id -> Queue
         self.capture_threads = {}  # camera_id -> Thread
+        self.stop_flags = {}  # camera_id -> Event for stopping
         
         # State
         self.running = False
@@ -129,16 +130,21 @@ class CameraManager:
                 logger.error(f"Camera {camera_id} not found")
                 return False
             
+            # Create stop event for this camera
+            stop_event = threading.Event()
+            self.stop_flags[camera_id] = stop_event
+            
             # Connect to camera
             camera = self.cameras[camera_id]
             if not camera.connect():
                 logger.error(f"Failed to connect to camera {camera_id}")
+                del self.stop_flags[camera_id]
                 return False
             
             # Start capture thread
             thread = threading.Thread(
                 target=self._capture_loop,
-                args=(camera_id,),
+                args=(camera_id, stop_event),
                 daemon=True,
                 name=f"Camera-{camera_id}"
             )
@@ -160,15 +166,27 @@ class CameraManager:
             except Exception as e:
                 logger.error(f"Error disconnecting camera {camera_id}: {e}")
         
+        # Clean up stop flag
+        if camera_id in self.stop_flags:
+            del self.stop_flags[camera_id]
+        
         logger.info(f"Camera {camera_id} stopped")
-    
+
     def _stop_capture_thread(self, camera_id):
         """Stop capture thread for a camera"""
+        if camera_id in self.stop_flags:
+            # Signal thread to stop
+            self.stop_flags[camera_id].set()
+        
+        # Wait for thread to finish (with timeout)
         if camera_id in self.capture_threads:
-            # Thread will exit on next iteration due to running flag
-            pass
+            thread = self.capture_threads[camera_id]
+            thread.join(timeout=2.0)  # Wait up to 2 seconds
+            if thread.is_alive():
+                logger.warning(f"Capture thread for {camera_id} did not stop gracefully")
+            del self.capture_threads[camera_id]
     
-    def _capture_loop(self, camera_id):
+    def _capture_loop(self, camera_id, stop_event):
         """
         Continuous capture loop for one camera
         
@@ -177,7 +195,7 @@ class CameraManager:
         camera = self.cameras[camera_id]
         frame_queue = self.frame_queues[camera_id]
         
-        while self.running and camera_id in self.cameras:
+        while self.running and camera_id in self.cameras and not stop_event.is_set():
             start_time = time.time()
             
             # Read frame

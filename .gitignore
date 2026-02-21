@@ -29,6 +29,21 @@ env.bak/
 venv.bak/
 .venv/
 
+# Node.js / Frontend
+node_modules/
+npm-debug.log
+npm-error.log
+yarn-error.log
+.yarn/
+pnpm-lock.yaml
+yarn.lock
+package-lock.json
+
+# Frontend build
+frontend/dist/
+frontend/.vite/
+frontend/build/
+
 # IDEs and editors
 .vscode/
 .idea/
@@ -37,6 +52,7 @@ venv.bak/
 *~
 *.sublime-project
 *.sublime-workspace
+.DS_Store
 
 # OS specific
 .DS_Store
@@ -57,6 +73,7 @@ app.log
 TrainingImage/*.jpg
 TrainingImage/*.jpeg
 TrainingImage/*.png
+TrainingImageLabel/
 Attendance/*.csv
 StudentDetails/*.csv
 model/*.pkl
@@ -116,5 +133,4 @@ secrets.json
 *.tmp
 *.temp
 *.bak
-
-TrainingImageLabel/
+/plans

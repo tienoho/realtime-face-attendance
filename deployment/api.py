@@ -37,12 +37,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 app = Flask(__name__)
 
-# CORS configuration
-CORS_CONFIG = os.getenv('CORS_ORIGINS', '*')
-if CORS_CONFIG == '*':
-    CORS(app, resources={r"/api/*": {"origins": "*"}})
+# CORS configuration - require explicit origins in production
+CORS_CONFIG = os.getenv('CORS_ORIGINS', '')
+if not CORS_CONFIG:
+    # In production, CORS_ORIGINS must be set. For development, allow common localhost ports.
+    if os.getenv('FLASK_ENV') == 'development':
+        CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"}})
+    else:
+        raise ValueError("CORS_ORIGINS environment variable must be set in production")
 else:
-    CORS(app, resources={r"/api/*": {"origins": CORS_CONFIG.split(',')}})
+    origins = CORS_CONFIG.split(',')
+    CORS(app, resources={r"/api/*": {"origins": origins}})
 
 # SocketIO setup
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
@@ -158,6 +163,7 @@ try:
     frame_processor.load_recognition_model(app.config['MODEL_PATH'])
     
     camera_manager.register_frame_callback(on_frame_captured)
+    camera_manager.register_frame_callback(on_frame_for_streaming)  # Register for WebSocket streaming
     frame_processor.register_detection_callback(on_faces_detected)
     frame_processor.register_recognition_callback(on_faces_recognized)
     
@@ -171,8 +177,20 @@ except ImportError as e:
 # Connected clients for streaming
 connected_clients = set()
 client_lock = threading.Lock()
-STREAM_QUALITY = 50
-STREAM_FPS = 5
+STREAM_QUALITY = 80
+STREAM_FPS = 10
+
+# Lock for streaming config
+config_lock = threading.Lock()
+
+# Streaming client subscriptions
+# {camera_id: {sid: True}}
+streaming_subscriptions = {}
+streaming_lock = threading.Lock()
+
+# Frame encoding settings
+ENCODE_QUALITY = 80
+FRAME_RESIZE_WIDTH = 640
 
 # ============================================================
 # HELPER FUNCTIONS
@@ -276,6 +294,147 @@ def on_faces_recognized(camera_id, recognized):
                 'timestamp': time.time()
             })
 
+
+def on_frame_for_streaming(camera_id, frame):
+    """
+    Callback to emit camera frames to subscribed WebSocket clients.
+    This is registered with the camera manager to receive all frames.
+    """
+    with streaming_lock:
+        if camera_id not in streaming_subscriptions:
+            return
+        subscribers = streaming_subscriptions.get(camera_id, {})
+        if not subscribers:
+            return
+    
+    # Encode frame to JPEG
+    try:
+        # Resize frame if too large (for bandwidth optimization)
+        h, w = frame.shape[:2]
+        if w > FRAME_RESIZE_WIDTH:
+            ratio = FRAME_RESIZE_WIDTH / w
+            new_w = FRAME_RESIZE_WIDTH
+            new_h = int(h * ratio)
+            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Encode to JPEG
+        encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), ENCODE_QUALITY]
+        _, buffer = cv2.imencode('.jpg', frame, encode_param)
+        frame_base64 = base64.b64encode(buffer).decode('utf-8')
+        
+        frame_data = f'data:image/jpeg;base64,{frame_base64}'
+        timestamp = time.time()
+        
+        # Emit to all subscribers
+        with streaming_lock:
+            subscribers = streaming_subscriptions.get(camera_id, {})
+        
+        for sid in list(subscribers.keys()):
+            try:
+                socketio.emit('camera_frame', {
+                    'camera_id': camera_id,
+                    'frame': frame_data,
+                    'timestamp': timestamp
+                }, room=sid)
+            except Exception as e:
+                logger.warning(f"Error emitting frame to {sid}: {e}")
+                # Remove disconnected client
+                with streaming_lock:
+                    if sid in streaming_subscriptions.get(camera_id, {}):
+                        del streaming_subscriptions[camera_id][sid]
+                        
+    except Exception as e:
+        logger.error(f"Error encoding frame for streaming: {e}")
+
+# ============================================================
+# MODEL TRAINING
+# ============================================================
+
+def train_face_recognition_model():
+    """
+    Train face recognition model from all images in TrainingImage folder.
+    This function loads all training images and their labels, then trains
+    the LBPH recognizer and saves the model.
+    
+    Returns:
+        dict: Training result with status and details
+    """
+    try:
+        training_folder = app.config['UPLOAD_FOLDER']
+        model_path = app.config['MODEL_PATH']
+        
+        # Get all image files
+        faces = []
+        labels = []
+        
+        # Walk through all subdirectories (each student has their own folder)
+        for student_id in os.listdir(training_folder):
+            student_path = os.path.join(training_folder, student_id)
+            if not os.path.isdir(student_path):
+                continue
+            
+            # Try to extract numeric label from student_id
+            try:
+                # Use the student_id as-is or convert to numeric
+                label = int(student_id) if student_id.isdigit() else hash(student_id) % 10000
+            except (ValueError, TypeError):
+                label = hash(student_id) % 10000
+            
+            # Load all images for this student
+            for img_name in os.listdir(student_path):
+                if not img_name.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    continue
+                    
+                img_path = os.path.join(student_path, img_name)
+                img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+                
+                if img is not None:
+                    faces.append(img)
+                    labels.append(label)
+        
+        if not faces:
+            logger.warning("No training images found")
+            return {'status': 'error', 'message': 'No training images found', 'images_trained': 0}
+        
+        # Train the model
+        recognizer = cv2.face.LBPHFaceRecognizer_create()
+        recognizer.train(faces, np.array(labels))
+        
+        # Ensure model directory exists
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+        
+        # Save the model
+        recognizer.save(model_path)
+        
+        # Update the cached recognizer
+        global _model_cache
+        _model_cache['face_recognizer'] = recognizer
+        
+        logger.info(f"Model trained successfully with {len(faces)} images")
+        
+        return {
+            'status': 'success',
+            'message': 'Model trained successfully',
+            'images_trained': len(faces),
+            'unique_labels': len(set(labels))
+        }
+        
+    except Exception as e:
+        logger.error(f"Error training model: {str(e)}")
+        return {'status': 'error', 'message': str(e), 'images_trained': 0}
+
+
+def train_model_async():
+    """
+    Background thread function for model training.
+    """
+    result = train_face_recognition_model()
+    if result['status'] == 'success':
+        socketio.emit('model_trained', result)
+    else:
+        socketio.emit('training_error', result)
+
+
 # ============================================================
 # AUTHENTICATION
 # ============================================================
@@ -332,12 +491,13 @@ def login():
                 return jsonify({'message': 'Invalid credentials'}), 401
             
             stored_hash = user[2]
-            if stored_hash.startswith('$2b$') or stored_hash.startswith('$2a$'):
-                if not check_password_hash(stored_hash, password):
-                    return jsonify({'message': 'Invalid credentials'}), 401
-            else:
-                if stored_hash != password:
-                    return jsonify({'message': 'Invalid credentials'}), 401
+            # Always use password hash verification - reject plaintext hashes
+            if not stored_hash.startswith('$2b'):
+                logger.error(f"User {username} has insecure plaintext password hash")
+                return jsonify({'message': 'Invalid credentials'}), 401
+            
+            if not check_password_hash(stored_hash, password):
+                return jsonify({'message': 'Invalid credentials'}), 401
 
             token = jwt.encode({
                 'user_id': user[0],
@@ -432,11 +592,22 @@ def register_student(current_user):
 
             logger.info(f"Student {student_id} ({name}) registered with {saved_count} images")
 
+        # Auto-train model after successful registration
+        logger.info("Starting auto-training after student registration...")
+        training_result = train_face_recognition_model()
+        
+        if training_result['status'] == 'success':
+            logger.info(f"Auto-training completed: {training_result['images_trained']} images")
+        else:
+            logger.warning(f"Auto-training failed: {training_result['message']}")
+
         return jsonify({
             'message': 'Student registered successfully',
             'student_id': student_id,
             'name': name,
-            'images_saved': saved_count
+            'images_saved': saved_count,
+            'model_trained': training_result['status'] == 'success',
+            'training_details': training_result
         }), 201
 
     except pymysql.Error as e:
@@ -752,6 +923,58 @@ def get_processing_stats(current_user):
 def get_recent_attendance(current_user):
     return jsonify({'records': [], 'count': 0})
 
+
+@app.route('/api/streaming/config', methods=['GET'])
+@token_required
+def get_streaming_config(current_user):
+    """Get current streaming configuration"""
+    return jsonify({
+        'quality': ENCODE_QUALITY,
+        'fps': STREAM_FPS,
+        'resize_width': FRAME_RESIZE_WIDTH
+    })
+
+
+@app.route('/api/streaming/config', methods=['POST'])
+@token_required
+def update_streaming_config(current_user):
+    """Update streaming configuration"""
+    global ENCODE_QUALITY, STREAM_FPS, FRAME_RESIZE_WIDTH
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({'message': 'No configuration provided'}), 400
+    
+    if 'quality' in data:
+        quality = int(data['quality'])
+        if 10 <= quality <= 100:
+            ENCODE_QUALITY = quality
+        else:
+            return jsonify({'message': 'Quality must be between 10 and 100'}), 400
+    
+    if 'fps' in data:
+        fps = int(data['fps'])
+        if 1 <= fps <= 30:
+            STREAM_FPS = fps
+        else:
+            return jsonify({'message': 'FPS must be between 1 and 30'}), 400
+    
+    if 'resize_width' in data:
+        width = int(data['resize_width'])
+        if 320 <= width <= 1920:
+            FRAME_RESIZE_WIDTH = width
+        else:
+            return jsonify({'message': 'Resize width must be between 320 and 1920'}), 400
+    
+    logger.info(f"Streaming config updated: quality={ENCODE_QUALITY}, fps={STREAM_FPS}, width={FRAME_RESIZE_WIDTH}")
+    
+    return jsonify({
+        'message': 'Configuration updated',
+        'quality': ENCODE_QUALITY,
+        'fps': STREAM_FPS,
+        'resize_width': FRAME_RESIZE_WIDTH
+    })
+
 # ============================================================
 # WEBSOCKET EVENTS
 # ============================================================
@@ -767,6 +990,16 @@ def handle_connect():
 def handle_disconnect():
     with client_lock:
         connected_clients.discard(request.sid)
+    
+    # Clean up streaming subscriptions
+    with streaming_lock:
+        for camera_id in list(streaming_subscriptions.keys()):
+            if request.sid in streaming_subscriptions.get(camera_id, {}):
+                del streaming_subscriptions[camera_id][request.sid]
+            if not streaming_subscriptions.get(camera_id, {}):
+                if camera_id in streaming_subscriptions:
+                    del streaming_subscriptions[camera_id]
+    
     logger.info(f"Client disconnected: {request.sid}")
 
 @socketio.on('subscribe_camera')
@@ -790,6 +1023,67 @@ def handle_subscribe_person(data):
     if person_id:
         socketio.join_room(f'person_{person_id}')
         emit('subscribed_person', {'person_id': person_id})
+
+
+@socketio.on('stream_camera')
+def handle_stream_camera(data):
+    """
+    Start streaming camera frames to this client.
+    Client sends: {camera_id: 'camera1'}
+    Server emits: 'camera_frame' events with base64 frame data
+    """
+    camera_id = data.get('camera_id')
+    if not camera_id:
+        emit('stream_error', {'message': 'camera_id is required'})
+        return
+    
+    # Check if camera exists
+    if camera_manager and camera_id in camera_manager.cameras:
+        with streaming_lock:
+            if camera_id not in streaming_subscriptions:
+                streaming_subscriptions[camera_id] = {}
+            streaming_subscriptions[request.sid] = True
+            streaming_subscriptions[camera_id][request.sid] = True
+        
+        emit('stream_started', {
+            'camera_id': camera_id,
+            'message': f'Started streaming from camera {camera_id}'
+        })
+        logger.info(f"Client {request.sid} started streaming camera {camera_id}")
+    else:
+        emit('stream_error', {'message': f'Camera {camera_id} not found'})
+
+
+@socketio.on('stop_stream_camera')
+def handle_stop_stream_camera(data):
+    """
+    Stop streaming camera frames from this client.
+    """
+    camera_id = data.get('camera_id')
+    
+    with streaming_lock:
+        if camera_id in streaming_subscriptions:
+            if request.sid in streaming_subscriptions[camera_id]:
+                del streaming_subscriptions[camera_id][request.sid]
+            # Clean up empty entries
+            if not streaming_subscriptions[camera_id]:
+                del streaming_subscriptions[camera_id]
+    
+    emit('stream_stopped', {'camera_id': camera_id})
+    logger.info(f"Client {request.sid} stopped streaming camera {camera_id}")
+
+
+@socketio.on('get_streaming_cameras')
+def handle_get_streaming_cameras():
+    """
+    Get list of cameras this client is streaming from.
+    """
+    with streaming_lock:
+        cameras = []
+        for cam_id, subscribers in streaming_subscriptions.items():
+            if request.sid in subscribers:
+                cameras.append(cam_id)
+    emit('streaming_cameras', {'cameras': cameras})
 
 # ============================================================
 # ERROR HANDLERS
