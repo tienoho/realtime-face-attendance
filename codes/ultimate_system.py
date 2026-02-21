@@ -15,6 +15,14 @@ import threading
 from datetime import datetime
 import platform
 import subprocess
+import logging
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -82,10 +90,15 @@ class App:
                 try:
                     self.recognizer = cv2.face.LBPHFaceRecognizer_create()
                     self.recognizer.read(model_path)
-                except:
-                    pass
+                    logger.info("Face recognition model loaded successfully")
+                except cv2.error as e:
+                    logger.error(f"OpenCV error loading model: {e}")
+                    self.recognizer = None
+                except Exception as e:
+                    logger.error(f"Unexpected error loading model: {e}")
+                    self.recognizer = None
         except Exception as e:
-            print(f"Model error: {e}")
+            logger.error(f"Model loading error: {e}")
     
     def _build_ui(self):
         """Build the minimal UI"""
@@ -563,8 +576,12 @@ class App:
                         if img is not None:
                             faces.append(img)
                             labels.append(label)
-                except:
-                    continue
+                        else:
+                            logger.warning(f"Could not read image: {img_name}")
+                except ValueError as e:
+                    logger.warning(f"Invalid label format in {img_name}: {e}")
+                except Exception as e:
+                    logger.error(f"Error processing {img_name}: {e}")
             
             if not faces:
                 self.root.after(0, lambda: self.train_label.config(text="No valid data"))
@@ -633,8 +650,10 @@ class App:
                                         marked.add(label)
                                     label_text = f"ID: {label}"
                                     color = (0, 255, 0)
-                            except:
-                                pass
+                            except cv2.error as e:
+                                logger.warning(f"OpenCV prediction error: {e}")
+                            except Exception as e:
+                                logger.error(f"Face recognition error: {e}")
                         
                         cv2.rectangle(display, (x, y), (x+w, y+h), color, 2)
                         cv2.putText(display, label_text, (x, y-10),
@@ -700,19 +719,22 @@ class App:
 # ═══════════════════════════════════════════════════════════
 
 def main():
-    print("Starting Face Attendance System...")
+    logger.info("Starting Face Attendance System...")
     
     try:
-        print(f"OpenCV: {cv2.__version__}")
-    except:
-        print("OpenCV not found")
+        logger.info(f"OpenCV version: {cv2.__version__}")
+    except Exception as e:
+        logger.error(f"OpenCV not found: {e}")
+        messagebox.showerror("Error", "OpenCV is not installed. Please run: pip install opencv-python")
         return
     
     try:
         cv2.face.LBPHFaceRecognizer_create()
-        print("Face recognition: OK")
-    except:
-        print("Face recognition: Not available")
+        logger.info("Face recognition: OK")
+    except Exception as e:
+        logger.error(f"Face recognition not available: {e}")
+        messagebox.showerror("Error", "Face recognition module not available. Please run: pip install opencv-contrib-python")
+        return
     
     root = tk.Tk()
     app = App(root)
