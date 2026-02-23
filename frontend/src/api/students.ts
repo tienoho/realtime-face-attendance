@@ -30,6 +30,48 @@ export interface RegisterStudentResponse {
   training_details?: TrainingResult
 }
 
+// Phase 2: Multi-image registration types
+export interface RegisterStudentMultiRequest {
+  student_id: string
+  name: string
+  images: File[]
+  apply_augmentation?: boolean
+}
+
+export interface RegisterStudentMultiResponse {
+  message: string
+  student_id: string
+  name: string
+  images_uploaded: number
+  faces_detected: number
+  images_saved: number
+  augmentation_applied: boolean
+  faiss_registration: {
+    status: string
+    message?: string
+    images_processed?: number
+  }
+  lbph_training: TrainingResult
+}
+
+// Capture single frame from webcam
+export interface CaptureFaceRequest {
+  student_id: string
+  name: string
+  image_data: string  // base64
+}
+
+export interface CaptureFaceResponse {
+  message: string
+  student_id: string
+  name: string
+  image_path: string
+  faiss_registration: {
+    status: string
+    message?: string
+  }
+}
+
 export const studentsApi = {
   getStudents: async (): Promise<{ students: Student[] }> => {
     const response = await api.get<{ students: Student[] }>('/students')
@@ -51,6 +93,39 @@ export const studentsApi = {
           'Content-Type': 'multipart/form-data',
         },
       }
+    )
+    return response.data
+  },
+
+  // Phase 2: Multi-image registration
+  registerStudentMulti: async (data: RegisterStudentMultiRequest): Promise<RegisterStudentMultiResponse> => {
+    const formData = new FormData()
+    formData.append('student_id', data.student_id)
+    formData.append('name', data.name)
+    formData.append('apply_augmentation', data.apply_augmentation !== false ? 'true' : 'false')
+    
+    // Append multiple images
+    data.images.forEach((file, index) => {
+      formData.append('images', file)
+    })
+
+    const response = await api.post<RegisterStudentMultiResponse>(
+      '/register-student-multi',
+      formData,
+      {
+        headers: {
+          'Content-Type': 'multipart/form-data',
+        },
+      }
+    )
+    return response.data
+  },
+
+  // Capture face from webcam
+  captureFace: async (data: CaptureFaceRequest): Promise<CaptureFaceResponse> => {
+    const response = await api.post<CaptureFaceResponse>(
+      '/register-face-capture',
+      data
     )
     return response.data
   },

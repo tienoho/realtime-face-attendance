@@ -1,6 +1,10 @@
 """
 Frame Processor - Multi-camera video processing pipeline
 Handles face detection and recognition for multiple camera streams
+
+NOTE: This module now supports two modes:
+1. Legacy mode: Haar Cascade + MediaPipe + LBPH (original)
+2. InsightFace mode: RetinaFace + ArcFace + FAISS (recommended)
 """
 import cv2
 import numpy as np
@@ -13,28 +17,73 @@ from concurrent.futures import ThreadPoolExecutor, Future
 
 logger = logging.getLogger(__name__)
 
+# Try to import InsightFace pipeline
+try:
+    from face_recognition.pipeline import FaceRecognitionPipeline
+    from face_recognition.detector import FaceDetector
+    INSIGHTFACE_AVAILABLE = True
+except ImportError:
+    logger.warning("InsightFace not available, using legacy detection")
+    INSIGHTFACE_AVAILABLE = False
+    FaceRecognitionPipeline = None
+    FaceDetector = None
+
+# Module-level singleton for pipeline (used by FrameProcessor)
+_pipeline_instance = None
+_pipeline_lock = threading.Lock()
+
 
 class FrameProcessor:
     """
     Process frames from multiple cameras with face detection and recognition
+    
+    Supports two modes:
+    - InsightFace mode (default): Uses RetinaFace + ArcFace + FAISS
+    - Legacy mode: Uses Haar Cascade + MediaPipe + LBPH
     """
     
-    def __init__(self, num_workers=4):
+    def __init__(
+        self, 
+        num_workers=4,
+        use_insightface: bool = True,
+        det_threshold: float = 0.5,
+        recognition_threshold: float = 0.6,
+        frame_skip: int = 1
+    ):
+        """
+        Initialize frame processor.
+        
+        Args:
+            num_workers: Number of worker threads
+            use_insightface: Use InsightFace pipeline (recommended)
+            det_threshold: Face detection confidence threshold
+            recognition_threshold: Face recognition similarity threshold
+            frame_skip: Process every Nth frame (for performance)
+        """
         self.num_workers = num_workers
         self.executor = ThreadPoolExecutor(max_workers=num_workers)
         
-        # Face detection
+        # Use InsightFace or legacy
+        self.use_insightface = use_insightface and INSIGHTFACE_AVAILABLE
+        
+        # Configuration
+        self.det_threshold = det_threshold
+        self.recognition_threshold = recognition_threshold
+        self.frame_skip = frame_skip
+        self.frame_count = 0
+        
+        # InsightFace pipeline (singleton)
+        self.pipeline = None
+        
+        # Legacy detectors
         self.face_cascade = None
         self.mp_face_detection = None
-        
-        # Face recognition
         self.face_recognizer = None
         self.model_path = None
         
         # Processing configuration
         self.detection_confidence = 0.5
-        self.recognition_threshold = 70
-        self.frame_skip = 1
+        self.recognition_confidence_threshold = 70
         
         # Results storage
         self.results = defaultdict(dict)
@@ -53,11 +102,14 @@ class FrameProcessor:
         self.detection_callbacks = []
         self.recognition_callbacks = []
         
-        # Initialize detectors
-        self._initialize_detectors()
+        # Initialize based on mode
+        if self.use_insightface:
+            self._initialize_insightface_pipeline()
+        else:
+            self._initialize_legacy_detectors()
     
     def _initialize_detectors(self):
-        """Initialize face detectors"""
+        """Initialize face detectors (legacy mode)"""
         try:
             # Try to load Haar Cascade - use absolute path
             import os
@@ -84,8 +136,34 @@ class FrameProcessor:
         except ImportError:
             logger.warning("MediaPipe not available, using Haar Cascade only")
     
+    def _initialize_insightface_pipeline(self):
+        """Initialize InsightFace pipeline (recommended mode)"""
+        global _pipeline_instance
+        
+        with _pipeline_lock:
+            if _pipeline_instance is None:
+                try:
+                    _pipeline_instance = FaceRecognitionPipeline(
+                        det_threshold=self.det_threshold,
+                        recognition_threshold=self.recognition_threshold,
+                        attendance_cooldown=300  # 5 minutes
+                    )
+                    logger.info("InsightFace pipeline initialized (singleton)")
+                except Exception as e:
+                    logger.error(f"Failed to initialize InsightFace pipeline: {e}")
+                    self.use_insightface = False
+                    self._initialize_legacy_detectors()
+                    return
+            
+            self.pipeline = _pipeline_instance
+            logger.info(f"Using InsightFace pipeline: {self.pipeline}")
+    
     def load_recognition_model(self, model_path):
-        """Load face recognition model"""
+        """Load face recognition model (legacy mode)"""
+        if self.use_insightface:
+            logger.info("Using InsightFace pipeline, legacy model not needed")
+            return True
+        
         try:
             if os.path.exists(model_path):
                 self.face_recognizer = cv2.face.LBPHFaceRecognizer_create()
@@ -100,16 +178,33 @@ class FrameProcessor:
             logger.error(f"Failed to load recognition model: {e}")
             return False
     
-    def set_recognition_threshold(self, threshold):
+    def set_detection_threshold(self, threshold: float):
+        """Set detection confidence threshold"""
+        self.det_threshold = threshold
+        if self.pipeline:
+            self.pipeline.det_threshold = threshold
+        logger.info(f"Detection threshold set to {threshold}")
+    
+    def set_recognition_threshold(self, threshold: float):
         """Set recognition confidence threshold"""
         self.recognition_threshold = threshold
+        if self.pipeline:
+            self.pipeline.recognition_threshold = threshold
+        logger.info(f"Recognition threshold set to {threshold}")
+    
+    def set_frame_skip(self, skip: int):
+        """Set frame skip interval (process every Nth frame)"""
+        self.frame_skip = max(1, skip)
+        logger.info(f"Frame skip set to {self.frame_skip}")
     
     def detect_faces(self, frame):
         """
-        Detect faces in a frame using both methods
+        Detect faces in a frame.
+        
+        Uses InsightFace if available, otherwise falls back to legacy methods.
         
         Returns:
-            list: List of face bounding boxes [(x, y, w, h), ...]
+            list: List of face bounding boxes [(x, y, w, h), ...] or DetectedFace objects
         """
         if frame is None or frame.size == 0:
             return []
@@ -118,7 +213,16 @@ class FrameProcessor:
         if len(frame.shape) < 2:
             return []
         
-        # Convert to grayscale
+        # Use InsightFace if available
+        if self.use_insightface and self.pipeline:
+            try:
+                faces = self.pipeline.detector.detect(frame)
+                # Convert DetectedFace to tuple format for compatibility
+                return [(f.bbox[0], f.bbox[1], f.bbox[2]-f.bbox[0], f.bbox[3]-f.bbox[1]) for f in faces]
+            except Exception as e:
+                logger.error(f"InsightFace detection error: {e}")
+        
+        # Legacy detection methods
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         faces = []
@@ -160,7 +264,7 @@ class FrameProcessor:
     
     def recognize_faces(self, frame, faces):
         """
-        Recognize faces in a frame
+        Recognize faces in a frame.
         
         Args:
             frame: Input frame
@@ -169,7 +273,27 @@ class FrameProcessor:
         Returns:
             list: List of recognition results
         """
-        if not faces or self.face_recognizer is None:
+        if not faces:
+            return []
+        
+        # Use InsightFace pipeline if available
+        if self.use_insightface and self.pipeline:
+            try:
+                results = self.pipeline.process_frame(frame, track_attendance=False)
+                return [
+                    {
+                        'bbox': (int(r.bbox[0]), int(r.bbox[1]), 
+                                int(r.bbox[2]-r.bbox[0]), int(r.bbox[3]-r.bbox[1])),
+                        'person_id': r.student_id,
+                        'confidence': float(r.confidence)
+                    }
+                    for r in results if r.is_recognized
+                ]
+            except Exception as e:
+                logger.error(f"InsightFace recognition error: {e}")
+        
+        # Legacy recognition
+        if self.face_recognizer is None:
             return []
         
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -197,17 +321,91 @@ class FrameProcessor:
     
     def process_frame(self, camera_id, frame):
         """
-        Process a single frame from a camera
+        Process a single frame from a camera.
+        
+        Supports frame skipping for performance optimization.
         
         Args:
             camera_id: Camera identifier
             frame: Input frame
         
         Returns:
-            dict: Processing results
+            dict: Processing results (None if frame skipped)
         """
+        # Frame skipping for performance
+        self.frame_count += 1
+        if self.frame_skip > 1 and (self.frame_count % self.frame_skip) != 0:
+            return None
+        
         start_time = time.time()
         
+        # Use InsightFace pipeline for both detection and recognition
+        if self.use_insightface and self.pipeline:
+            try:
+                results = self.pipeline.process_frame(frame, camera_id=camera_id, track_attendance=False)
+                
+                recognized = [
+                    {
+                        'bbox': (int(r.bbox[0]), int(r.bbox[1]), 
+                                int(r.bbox[2]-r.bbox[0]), int(r.bbox[3]-r.bbox[1])),
+                        'person_id': r.student_id,
+                        'confidence': float(r.confidence)
+                    }
+                    for r in results if r.is_recognized
+                ]
+                
+                faces = [
+                    (int(r.bbox[0]), int(r.bbox[1]), 
+                     int(r.bbox[2]-r.bbox[0]), int(r.bbox[3]-r.bbox[1]))
+                    for r in results
+                ]
+                
+                process_time = time.time() - start_time
+                
+                # Update statistics
+                stats = self.stats[camera_id]
+                stats['frames_processed'] += 1
+                stats['faces_detected'] += len(faces)
+                stats['faces_recognized'] += len(recognized)
+                stats['processing_time'] += process_time
+                stats['last_result_time'] = time.time()
+                
+                # Store results
+                result = {
+                    'camera_id': camera_id,
+                    'timestamp': time.time(),
+                    'faces_detected': len(faces),
+                    'faces': faces,
+                    'recognized': recognized,
+                    'processing_time': process_time,
+                    'frame_shape': frame.shape,
+                    'mode': 'insightface'
+                }
+                
+                with self.results_lock:
+                    self.results[camera_id] = result
+                
+                # Call detection callbacks
+                for callback in self.detection_callbacks:
+                    try:
+                        callback(camera_id, result)
+                    except Exception as e:
+                        logger.error(f"Detection callback error: {e}")
+                
+                # Call recognition callbacks
+                for callback in self.recognition_callbacks:
+                    try:
+                        if recognized:
+                            callback(camera_id, recognized)
+                    except Exception as e:
+                        logger.error(f"Recognition callback error: {e}")
+                
+                return result
+                
+            except Exception as e:
+                logger.error(f"InsightFace processing error: {e}")
+        
+        # Legacy processing
         # Detect faces
         faces = self.detect_faces(frame)
         
@@ -233,7 +431,8 @@ class FrameProcessor:
             'faces': faces,
             'recognized': recognized,
             'processing_time': process_time,
-            'frame_shape': frame.shape
+            'frame_shape': frame.shape,
+            'mode': 'legacy'
         }
         
         with self.results_lock:
@@ -297,6 +496,27 @@ class FrameProcessor:
             for camera_id, stats in self.stats.items()
         }
     
+    def get_config(self):
+        """Get current configuration"""
+        config = {
+            'use_insightface': self.use_insightface,
+            'insightface_available': INSIGHTFACE_AVAILABLE,
+            'det_threshold': self.det_threshold,
+            'recognition_threshold': self.recognition_threshold,
+            'frame_skip': self.frame_skip,
+            'frame_count': self.frame_count
+        }
+        
+        if self.use_insightface and self.pipeline:
+            config['pipeline'] = {
+                'detector': str(self.pipeline.detector),
+                'embedder': str(self.pipeline.embedder),
+                'vector_store_size': len(self.pipeline.vector_store),
+                'attendance_cooldown': self.pipeline.attendance_cooldown
+            }
+        
+        return config
+    
     def shutdown(self):
         """Shutdown the processor"""
         self.executor.shutdown(wait=True)
@@ -305,11 +525,14 @@ class FrameProcessor:
 
 class AdaptiveFrameProcessor(FrameProcessor):
     """
-    Adaptive frame processor that adjusts processing based on load
+    Adaptive frame processor that adjusts processing based on load.
+    
+    Automatically adjusts frame skipping based on processing time
+    to maintain target FPS.
     """
     
-    def __init__(self, num_workers=4, target_fps=10):
-        super().__init__(num_workers)
+    def __init__(self, num_workers=4, target_fps=10, use_insightface=True):
+        super().__init__(num_workers, use_insightface=use_insightface)
         self.target_fps = target_fps
         self.frame_skip = 1
         self.frame_count = 0
@@ -319,7 +542,7 @@ class AdaptiveFrameProcessor(FrameProcessor):
         self.max_frame_times = 30
     
     def should_process(self):
-        """Determine if frame should be processed"""
+        """Determine if frame should be processed based on load"""
         self.frame_count += 1
         
         # Skip frames based on current load
@@ -329,12 +552,16 @@ class AdaptiveFrameProcessor(FrameProcessor):
         # Check if we need to skip frames
         if len(self.frame_times) >= self.max_frame_times:
             avg_time = sum(self.frame_times) / len(self.frame_times)
-            if avg_time > (1.0 / self.target_fps):
+            target_time = 1.0 / self.target_fps
+            
+            if avg_time > target_time:
                 # Processing is too slow, skip more frames
                 self.frame_skip = min(self.frame_skip + 1, 5)
+                logger.info(f"Adaptive: Increased frame_skip to {self.frame_skip} (avg: {avg_time:.3f}s, target: {target_time:.3f}s)")
             elif self.frame_skip > 1:
                 # Processing is fast, skip fewer frames
                 self.frame_skip = max(self.frame_skip - 1, 1)
+                logger.info(f"Adaptive: Decreased frame_skip to {self.frame_skip}")
             
             self.frame_times = []
         
@@ -349,18 +576,55 @@ class AdaptiveFrameProcessor(FrameProcessor):
         result = super().process_frame(camera_id, frame)
         
         # Track processing time
-        self.frame_times.append(time.time() - start_time)
+        if result:
+            self.frame_times.append(time.time() - start_time)
         
         return result
 
 
 # Singleton instance
 _frame_processor = None
+_processor_lock = threading.Lock()
 
 
-def get_frame_processor(num_workers=4):
-    """Get the global frame processor instance"""
+def get_frame_processor(
+    num_workers=4, 
+    use_insightface: bool = True,
+    det_threshold: float = 0.5,
+    recognition_threshold: float = 0.6
+):
+    """
+    Get the global frame processor instance.
+    
+    Args:
+        num_workers: Number of worker threads
+        use_insightface: Use InsightFace pipeline (recommended)
+        det_threshold: Detection confidence threshold
+        recognition_threshold: Recognition similarity threshold
+    
+    Returns:
+        FrameProcessor: Configured frame processor
+    """
     global _frame_processor
+    
+    # Double-checked locking for thread safety
     if _frame_processor is None:
-        _frame_processor = FrameProcessor(num_workers)
+        with _processor_lock:
+            if _frame_processor is None:
+                _frame_processor = FrameProcessor(
+                    num_workers=num_workers,
+                    use_insightface=use_insightface,
+                    det_threshold=det_threshold,
+                    recognition_threshold=recognition_threshold
+                )
     return _frame_processor
+
+
+def reset_frame_processor():
+    """Reset the global frame processor (useful for testing)"""
+    global _frame_processor, _pipeline_instance
+    if _frame_processor:
+        _frame_processor.shutdown()
+    _frame_processor = None
+    _pipeline_instance = None
+    logger.info("Frame processor reset")

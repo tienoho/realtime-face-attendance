@@ -14,6 +14,7 @@ from functools import wraps
 import cv2
 import numpy as np
 import pymysql
+import psycopg2  # For PostgreSQL support
 import jwt
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 from flask import Flask, request, jsonify, render_template
@@ -25,11 +26,43 @@ from werkzeug.exceptions import BadRequest, Unauthorized, InternalServerError
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
 
-# Mediapipe imports
-import mediapipe as mp
+# InsightFace imports
+try:
+    from insightface.app import FaceAnalysis
+except ImportError:
+    logger.warning("InsightFace not installed, using legacy methods")
+    FaceAnalysis = None
+
+# Data augmentation imports
+try:
+    from face_recognition.augmentation import DataAugmentor, augment_face_batch
+except ImportError:
+    logger.warning("Data augmentation module not found")
+    DataAugmentor = None
+    augment_face_batch = None
 
 # Add parent directory to path for camera imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# ============================================================
+# DATABASE TYPE SELECTION
+# ============================================================
+
+# Set DB_TYPE to 'mysql' or 'postgresql' (default: mysql for backward compatibility)
+DB_TYPE = os.getenv('DB_TYPE', 'mysql').lower()
+
+# Import appropriate database module
+if DB_TYPE == 'postgresql':
+    try:
+        from database import get_db_connection, init_db_pool, close_db_pool, get_table_list, check_db_health
+        logger.info(f"Using PostgreSQL database (DB_TYPE={DB_TYPE})")
+    except ImportError as e:
+        logger.warning(f"PostgreSQL module error: {e}, falling back to MySQL")
+        DB_TYPE = 'mysql'
+        from database import get_db_connection, init_db_pool, close_db_pool
+else:
+    from database import get_db_connection, init_db_pool, close_db_pool
+    logger.info(f"Using MySQL database (DB_TYPE={DB_TYPE})")
 
 # ============================================================
 # FLASK & SOCKETIO SETUP
@@ -82,11 +115,14 @@ app.config['CASCADE_PATH'] = os.getenv('CASCADE_PATH', 'model/Haarcascade.xml')
 
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
-    'user': os.getenv('DB_USER', 'root'),
+    'port': int(os.getenv('DB_PORT', 5432)),  # PostgreSQL default
+    'user': os.getenv('DB_USER', 'postgres'),  # PostgreSQL default
     'password': os.getenv('DB_PASSWORD', ''),
-    'db': os.getenv('DB_NAME', 'face_attendance'),
+    'database': os.getenv('DB_NAME', 'face_attendance'),
     'charset': 'utf8mb4',
-    'autocommit': True
+    'autocommit': True,
+    'sslmode': os.getenv('DB_SSLMODE', 'prefer'),
+    'client_encoding': 'UTF8',
 }
 
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
@@ -156,14 +192,25 @@ def get_mediapipe_detector():
 
 try:
     from cameras.camera_manager import CameraManager
-    from cameras.frame_processor import FrameProcessor
+    from cameras.frame_processor import FrameProcessor, AdaptiveFrameProcessor
+    from cameras.attendance_engine import AttendanceEngine
     
     camera_manager = CameraManager(max_cameras=16, frame_queue_size=5)
-    frame_processor = FrameProcessor(num_workers=4)
-    frame_processor.load_recognition_model(app.config['MODEL_PATH'])
+    
+    # Initialize frame processor with InsightFace (recommended)
+    # Set use_insightface=False to use legacy detection
+    frame_processor = FrameProcessor(
+        num_workers=4,
+        use_insightface=True,
+        det_threshold=0.5,
+        recognition_threshold=0.6
+    )
+    
+    # Initialize attendance engine
+    attendance_engine = AttendanceEngine(dedup_window=300)
     
     camera_manager.register_frame_callback(on_frame_captured)
-    camera_manager.register_frame_callback(on_frame_for_streaming)  # Register for WebSocket streaming
+    camera_manager.register_frame_callback(on_frame_for_streaming)
     frame_processor.register_detection_callback(on_faces_detected)
     frame_processor.register_recognition_callback(on_faces_recognized)
     
@@ -173,6 +220,7 @@ except ImportError as e:
     CAMERA_SYSTEM_AVAILABLE = False
     camera_manager = None
     frame_processor = None
+    attendance_engine = None
 
 # Connected clients for streaming
 connected_clients = set()
@@ -192,16 +240,7 @@ streaming_lock = threading.Lock()
 ENCODE_QUALITY = 80
 FRAME_RESIZE_WIDTH = 640
 
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
-def get_db_connection():
-    try:
-        return pymysql.connect(**DB_CONFIG)
-    except pymysql.Error as e:
-        logger.error(f"Database connection error: {e}")
-        raise
+# Use get_db_connection from the imported database module (mysql or postgresql)
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
@@ -512,7 +551,7 @@ def login():
                 'username': user[1]
             }), 200
             
-    except pymysql.Error as e:
+    except (pymysql.Error, psycopg2.Error) as e:
         logger.error(f"Database error during login: {e}")
         return jsonify({'message': 'Database error'}), 500
     except Exception as e:
@@ -610,12 +649,369 @@ def register_student(current_user):
             'training_details': training_result
         }), 201
 
-    except pymysql.Error as e:
+    except (pymysql.Error, psycopg2.Error) as e:
         logger.error(f"Database error during registration: {e}")
         return jsonify({'message': 'Database error'}), 500
     except Exception as e:
         logger.error(f"Registration error: {str(e)}")
         return jsonify({'message': f'Server error: {str(e)}'}), 500
+
+# ============================================================
+# PHASE 2: MULTI-IMAGE REGISTRATION ENDPOINT
+# ============================================================
+
+# Initialize Face Recognition Pipeline (singleton)
+_face_pipeline = None
+_face_pipeline_lock = threading.Lock()
+
+# Initialize Face Detector (singleton) - for multi-image processing
+_face_detector = None
+_face_detector_lock = threading.Lock()
+
+def get_face_pipeline():
+    """Get or create the face recognition pipeline."""
+    global _face_pipeline
+    with _face_pipeline_lock:
+        if _face_pipeline is None:
+            try:
+                from face_recognition.pipeline import FaceRecognitionPipeline
+                _face_pipeline = FaceRecognitionPipeline()
+                logger.info("Face Recognition Pipeline initialized for registration")
+            except Exception as e:
+                logger.error(f"Failed to initialize face pipeline: {e}")
+                return None
+        return _face_pipeline
+
+def get_face_detector():
+    """Get or create the face detector (cached for performance)."""
+    global _face_detector
+    with _face_detector_lock:
+        if _face_detector is None:
+            try:
+                from face_recognition.detector import FaceDetector
+                _face_detector = FaceDetector()
+                logger.info("Face Detector initialized and cached")
+            except Exception as e:
+                logger.warning(f"InsightFace not available: {e}")
+                _face_detector = None
+        return _face_detector
+
+@app.route('/api/register-student-multi', methods=['POST'])
+@token_required
+def register_student_multi(current_user):
+    """
+    Register a student with multiple images.
+    
+    Accepts:
+    - student_id: Student ID
+    - name: Student name
+    - images: Multiple image files (at least 5 recommended)
+    - apply_augmentation: Whether to apply data augmentation
+    
+    Returns:
+    - Student registration result with training details
+    """
+    try:
+        # Check for images
+        files = request.files.getlist('images')
+        if not files or len(files) == 0:
+            return jsonify({'message': 'No images provided'}), 400
+        
+        # Limit number of images to prevent DoS
+        if len(files) > 20:
+            return jsonify({'message': 'Maximum 20 images allowed'}), 400
+        
+        if len(files) < 3:
+            logger.warning(f"Only {len(files)} images provided, recommend at least 5-10")
+        
+        # Get form data
+        student_id = request.form.get('student_id', '').strip()
+        name = request.form.get('name', '').strip()
+        apply_augmentation = request.form.get('apply_augmentation', 'true').lower() == 'true'
+        
+        # Validate inputs
+        valid, error = validate_student_id(student_id)
+        if not valid:
+            return jsonify({'message': error}), 400
+        
+        valid, error = validate_name(name)
+        if not valid:
+            return jsonify({'message': error}), 400
+        
+        # Check if student already exists
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM students WHERE student_id = %s', (student_id,))
+            if cursor.fetchone():
+                return jsonify({'message': f'Student ID {student_id} already exists'}), 409
+        
+        # Process images using cached detector
+        valid_images = []
+        
+        # Use cached face detector
+        face_detector = get_face_detector()
+        if face_detector is None:
+            logger.warning("InsightFace not available, using MediaPipe fallback")
+        
+        for i, file in enumerate(files):
+            if not allowed_file(file.filename):
+                continue
+                
+            try:
+                # Read and decode image
+                img_bytes = file.read()
+                nparr = np.frombuffer(img_bytes, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                
+                if img is None:
+                    logger.warning(f"Invalid image {i}: could not decode")
+                    continue
+                
+                # Detect face
+                if face_detector:
+                    faces = face_detector.detect(img)
+                    if faces:
+                        # Use largest face
+                        face = max(faces, key=lambda f: f.confidence)
+                        face_crop = face_detector.get_face_crop(img, face.bbox, padding=20)
+                        if face_crop is not None and face_crop.size > 0:
+                            valid_images.append(face_crop)
+                            logger.debug(f"Image {i}: face detected, crop size: {face_crop.shape}")
+                else:
+                    # Fallback to MediaPipe
+                    face_boxes = detect_faces_mediapipe(img)
+                    if face_boxes:
+                        x, y, w, h = face_boxes[0]
+                        pad = 20
+                        x1 = max(0, x - pad)
+                        y1 = max(0, y - pad)
+                        x2 = min(img.shape[1], x + w + pad)
+                        y2 = min(img.shape[0], y + h + pad)
+                        face_crop = img[y1:y2, x1:x2]
+                        if face_crop.size > 0:
+                            valid_images.append(face_crop)
+                            logger.debug(f"Image {i}: face detected (MediaPipe), crop size: {face_crop.shape}")
+                            
+            except Exception as img_err:
+                logger.warning(f"Error processing image {i}: {img_err}")
+        
+        if len(valid_images) < 1:
+            return jsonify({'message': 'No valid faces detected in any image'}), 400
+        
+        logger.info(f"Detected {len(valid_images)} valid face images from {len(files)} uploaded")
+        
+        # Apply data augmentation if requested
+        original_count = len(valid_images)
+        if apply_augmentation and augment_face_batch:
+            try:
+                # Target 10-15 images for good recognition
+                target = min(15, max(10, original_count * 3))
+                valid_images = augment_face_batch(valid_images, target_count=target)
+                logger.info(f"Applied augmentation: {original_count} -> {len(valid_images)} images")
+            except Exception as aug_err:
+                logger.warning(f"Augmentation failed: {aug_err}")
+        
+        # Save images to disk
+        student_folder = os.path.join(app.config['UPLOAD_FOLDER'], student_id)
+        os.makedirs(student_folder, exist_ok=True)
+        
+        saved_count = 0
+        for i, img in enumerate(valid_images):
+            try:
+                img_filename = f"{student_id}_{i:03d}.jpg"
+                img_path = os.path.join(student_folder, img_filename)
+                cv2.imwrite(img_path, img)
+                saved_count += 1
+            except Exception as save_err:
+                logger.warning(f"Failed to save image {i}: {save_err}")
+        
+        # Insert student into database
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO students (student_id, name) VALUES (%s, %s)',
+                (student_id, name)
+            )
+            
+            # Insert training image records
+            for i in range(saved_count):
+                img_path = os.path.join(student_folder, f"{student_id}_{i:03d}.jpg")
+                cursor.execute(
+                    'INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)',
+                    (student_id, img_path)
+                )
+        
+        # Register with Face Recognition Pipeline (FAISS)
+        pipeline_result = {'status': 'not_available'}
+        pipeline = get_face_pipeline()
+        
+        if pipeline:
+            try:
+                # Use original images (without augmentation) for embedding
+                result = pipeline.register_face(student_id, name, valid_images[:original_count])
+                pipeline_result = {
+                    'status': 'success' if result.get('success') else 'error',
+                    'message': result.get('message', ''),
+                    'images_processed': result.get('images_processed', 0)
+                }
+                logger.info(f"FAISS registration: {pipeline_result}")
+            except Exception as pipeline_err:
+                logger.error(f"Pipeline registration failed: {pipeline_err}")
+                pipeline_result = {'status': 'error', 'message': str(pipeline_err)}
+        
+        # Also train legacy LBPH model for backward compatibility (async)
+        def run_training():
+            try:
+                training_result = train_face_recognition_model()
+                if training_result.get('status') == 'success':
+                    logger.info(f"Background training completed: {training_result.get('images_trained')} images")
+                else:
+                    logger.warning(f"Background training failed: {training_result.get('message')}")
+            except Exception as train_err:
+                logger.error(f"Background training error: {train_err}")
+        
+        # Run training in background thread
+        threading.Thread(target=run_training, daemon=True).start()
+        
+        return jsonify({
+            'message': 'Student registered successfully',
+            'student_id': student_id,
+            'name': name,
+            'images_uploaded': len(files),
+            'faces_detected': len(valid_images),
+            'images_saved': saved_count,
+            'augmentation_applied': apply_augmentation,
+            'faiss_registration': pipeline_result,
+            'lbph_training': {'status': 'queued', 'message': 'Training started in background'}
+        }), 201
+        
+    except (pymysql.Error, psycopg2.Error) as e:
+        logger.error(f"Database error during multi-registration: {e}")
+        return jsonify({'message': 'Database error'}), 500
+    except Exception as e:
+        logger.error(f"Multi-registration error: {str(e)}")
+        return jsonify({'message': f'Server error: {str(e)}'}), 500
+
+
+@app.route('/api/register-face-capture', methods=['POST'])
+@token_required
+def register_face_capture(current_user):
+    """
+    Register a face from captured frame data (base64).
+    
+    Accepts:
+    - student_id: Student ID
+    - name: Student name
+    - image_data: Base64 encoded image
+    
+    Returns:
+    - Registration result
+    """
+    try:
+        data = request.get_json()
+        
+        if not data or not data.get('image_data'):
+            return jsonify({'message': 'No image data provided'}), 400
+        
+        student_id = data.get('student_id', '').strip()
+        name = data.get('name', '').strip()
+        image_data = data.get('image_data', '')
+        
+        # Validate
+        valid, error = validate_student_id(student_id)
+        if not valid:
+            return jsonify({'message': error}), 400
+        
+        valid, error = validate_name(name)
+        if not valid:
+            return jsonify({'message': error}), 400
+        
+        # Decode base64 image
+        try:
+            # Remove data URL prefix if present
+            if ',' in image_data:
+                image_data = image_data.split(',')[1]
+            img_bytes = base64.b64decode(image_data)
+            nparr = np.frombuffer(img_bytes, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        except Exception as decode_err:
+            return jsonify({'message': f'Invalid image data: {decode_err}'}), 400
+        
+        if img is None:
+            return jsonify({'message': 'Could not decode image'}), 400
+        
+        # Detect face using cached detector
+        face_detector = get_face_detector()
+        face_crop = None
+        if face_detector:
+            faces = face_detector.detect(img)
+            if faces:
+                face = max(faces, key=lambda f: f.confidence)
+                face_crop = face_detector.get_face_crop(img, face.bbox, padding=20)
+        else:
+            face_boxes = detect_faces_mediapipe(img)
+            if face_boxes:
+                x, y, w, h = face_boxes[0]
+                pad = 20
+                x1, y1 = max(0, x - pad), max(0, y - pad)
+                x2, y2 = min(img.shape[1], x + w + pad), min(img.shape[0], y + h + pad)
+                face_crop = img[y1:y2, x1:x2]
+        
+        if face_crop is None or face_crop.size == 0:
+            return jsonify({'message': 'No face detected in image'}), 400
+        
+        # Check if student exists
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT id FROM students WHERE student_id = %s', (student_id,))
+            exists = cursor.fetchone()
+            
+            if not exists:
+                cursor.execute('INSERT INTO students (student_id, name) VALUES (%s, %s)', (student_id, name))
+        
+        # Save image
+        student_folder = os.path.join(app.config['UPLOAD_FOLDER'], student_id)
+        os.makedirs(student_folder, exist_ok=True)
+        
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        img_filename = f"{student_id}_{timestamp}.jpg"
+        img_path = os.path.join(student_folder, img_filename)
+        cv2.imwrite(img_path, face_crop)
+        
+        # Record in DB
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                'INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)',
+                (student_id, img_path)
+            )
+        
+        # Register with FAISS if available
+        pipeline = get_face_pipeline()
+        faiss_result = {'status': 'not_available'}
+        
+        if pipeline:
+            try:
+                result = pipeline.register_face(student_id, name, [face_crop])
+                faiss_result = {
+                    'status': 'success' if result.get('success') else 'error',
+                    'message': result.get('message', '')
+                }
+            except Exception as e:
+                faiss_result = {'status': 'error', 'message': str(e)}
+        
+        return jsonify({
+            'message': 'Face captured successfully',
+            'student_id': student_id,
+            'name': name,
+            'image_path': img_path,
+            'faiss_registration': faiss_result
+        }), 201
+        
+    except Exception as e:
+        logger.error(f"Face capture error: {str(e)}")
+        return jsonify({'message': f'Server error: {str(e)}'}), 500
+
 
 @app.route('/api/register-face', methods=['POST'])
 @token_required
@@ -647,10 +1043,19 @@ def register_face(current_user):
             try:
                 with get_db_connection() as conn:
                     cursor = conn.cursor()
-                    cursor.execute(
-                        'INSERT INTO training_images (student_id, image_path) VALUES (%s, %s) ON DUPLICATE KEY UPDATE image_path=%s',
-                        (student_id, filepath, filepath)
-                    )
+                    # Use database-agnostic upsert logic
+                    cursor.execute('SELECT id FROM training_images WHERE student_id = %s', (student_id,))
+                    existing = cursor.fetchone()
+                    if existing:
+                        cursor.execute(
+                            'UPDATE training_images SET image_path = %s WHERE student_id = %s',
+                            (filepath, student_id)
+                        )
+                    else:
+                        cursor.execute(
+                            'INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)',
+                            (student_id, filepath)
+                        )
             except Exception as db_err:
                 logger.warning(f"Could not save to database: {db_err}")
 
@@ -720,7 +1125,7 @@ def mark_attendance(current_user):
 
             today = datetime.now().strftime('%Y-%m-%d')
             cursor.execute(
-                '''SELECT id FROM Attendance WHERE student_id = %s AND date = %s AND subject = %s''',
+                '''SELECT id FROM attendance WHERE student_id = %s AND date = %s AND subject = %s''',
                 (student_id, today, subject)
             )
             
@@ -734,7 +1139,7 @@ def mark_attendance(current_user):
 
             now = datetime.now()
             cursor.execute(
-                '''INSERT INTO Attendance (student_id, enrollment, name, date, time, subject, status, confidence_score)
+                '''INSERT INTO attendance (student_id, enrollment, name, date, time, subject, status, confidence_score)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
                 (student_id, student_id, student[1], now.strftime('%Y-%m-%d'), 
                  now.strftime('%H:%M:%S'), subject, 'Present', float(confidence))
@@ -752,7 +1157,7 @@ def mark_attendance(current_user):
             'confidence': float(confidence)
         }), 200
 
-    except pymysql.Error as e:
+    except (pymysql.Error, psycopg2.Error) as e:
         logger.error(f"Database error during attendance: {e}")
         return jsonify({'message': 'Database error'}), 500
     except Exception as e:
@@ -797,13 +1202,13 @@ def get_attendance_report(current_user):
             if subject:
                 cursor.execute(
                     '''SELECT a.student_id, a.name, a.date, a.time, a.subject, a.status, a.confidence_score
-                       FROM Attendance a WHERE a.date = %s AND a.subject = %s ORDER BY a.time''',
+                       FROM attendance a WHERE a.date = %s AND a.subject = %s ORDER BY a.time''',
                     (date, subject)
                 )
             else:
                 cursor.execute(
                     '''SELECT student_id, name, date, time, subject, status, confidence_score
-                       FROM Attendance WHERE date = %s ORDER BY time''',
+                       FROM attendance WHERE date = %s ORDER BY time''',
                     (date,)
                 )
             
@@ -922,6 +1327,65 @@ def get_processing_stats(current_user):
 @token_required
 def get_recent_attendance(current_user):
     return jsonify({'records': [], 'count': 0})
+
+
+# ============================================================
+# PHASE 5: PROCESSING CONFIGURATION ENDPOINTS
+# ============================================================
+
+@app.route('/api/processing/config', methods=['GET'])
+@token_required
+def get_processing_config(current_user):
+    """
+    Get current frame processing configuration.
+    """
+    if not frame_processor:
+        return jsonify({'error': 'Frame processor not available'}), 500
+    
+    config = frame_processor.get_config()
+    return jsonify(config)
+
+
+@app.route('/api/processing/config', methods=['POST'])
+@token_required
+def update_processing_config(current_user):
+    """
+    Update frame processing configuration.
+    """
+    if not frame_processor:
+        return jsonify({'error': 'Frame processor not available'}), 500
+    
+    data = request.get_json()
+    if not data:
+        return jsonify({'message': 'No configuration provided'}), 400
+    
+    if 'det_threshold' in data:
+        threshold = float(data['det_threshold'])
+        if 0.0 <= threshold <= 1.0:
+            frame_processor.set_detection_threshold(threshold)
+        else:
+            return jsonify({'message': 'det_threshold must be between 0.0 and 1.0'}), 400
+    
+    if 'recognition_threshold' in data:
+        threshold = float(data['recognition_threshold'])
+        if 0.0 <= threshold <= 1.0:
+            frame_processor.set_recognition_threshold(threshold)
+        else:
+            return jsonify({'message': 'recognition_threshold must be between 0.0 and 1.0'}), 400
+    
+    if 'frame_skip' in data:
+        skip = int(data['frame_skip'])
+        if 1 <= skip <= 10:
+            frame_processor.set_frame_skip(skip)
+        else:
+            return jsonify({'message': 'frame_skip must be between 1 and 10'}), 400
+    
+    logger.info(f"Processing config updated: {data}")
+    
+    return jsonify({
+        'message': 'Configuration updated',
+        'config': frame_processor.get_config()
+    })
 
 
 @app.route('/api/streaming/config', methods=['GET'])
