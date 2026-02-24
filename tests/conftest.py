@@ -14,6 +14,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 @pytest.fixture
 def app():
     """Create and configure a test instance of the Flask app"""
+    os.environ.setdefault('FLASK_ENV', 'development')
+    os.environ.setdefault('SECRET_KEY', 'test-secret-key')
+    os.environ.setdefault('DB_PASSWORD', 'test-db-password')
+    os.environ.setdefault('CORS_ORIGINS', 'http://localhost:5173')
+
     from deployment.api import app as flask_app
     
     # Configure for testing
@@ -64,8 +69,8 @@ def sample_image():
     img[25:75, 25:75] = 255  # White square in center
     
     # Convert to JPEG bytes
-    _, img_bytes = cv2.imencode('.    return BytesIOjpg', img)
-(img_bytes.getvalue())
+    _, img_bytes = cv2.imencode('.jpg', img)
+    return BytesIO(img_bytes.getvalue())
 
 
 @pytest.fixture

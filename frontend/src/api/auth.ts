@@ -1,4 +1,5 @@
 import api from './axios'
+import { ApiEnvelope, unwrapEnvelope } from './dto'
 
 export interface LoginRequest {
   username: string
@@ -13,8 +14,8 @@ export interface LoginResponse {
 
 export const authApi = {
   login: async (data: LoginRequest): Promise<LoginResponse> => {
-    const response = await api.post<LoginResponse>('/login', data)
-    return response.data
+    const response = await api.post<ApiEnvelope<LoginResponse>>('/login', data)
+    return unwrapEnvelope(response.data)
   },
 
   logout: () => {

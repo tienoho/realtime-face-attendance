@@ -70,6 +70,9 @@ class FrameProcessor:
         self.det_threshold = det_threshold
         self.recognition_threshold = recognition_threshold
         self.frame_skip = frame_skip
+        self.frame_count_lock = threading.Lock()
+        self.frame_counts = defaultdict(int)
+        # Backward-compatible aggregate counter.
         self.frame_count = 0
         
         # InsightFace pipeline (singleton)
@@ -108,7 +111,7 @@ class FrameProcessor:
         else:
             self._initialize_legacy_detectors()
     
-    def _initialize_detectors(self):
+    def _initialize_legacy_detectors(self):
         """Initialize face detectors (legacy mode)"""
         try:
             # Try to load Haar Cascade - use absolute path
@@ -135,6 +138,10 @@ class FrameProcessor:
             logger.info("MediaPipe face detector initialized")
         except ImportError:
             logger.warning("MediaPipe not available, using Haar Cascade only")
+
+    # Backward-compatible alias used by older call sites.
+    def _initialize_detectors(self):
+        self._initialize_legacy_detectors()
     
     def _initialize_insightface_pipeline(self):
         """Initialize InsightFace pipeline (recommended mode)"""
@@ -196,6 +203,13 @@ class FrameProcessor:
         """Set frame skip interval (process every Nth frame)"""
         self.frame_skip = max(1, skip)
         logger.info(f"Frame skip set to {self.frame_skip}")
+
+    def _next_frame_count(self, camera_id: str) -> int:
+        """Increment frame counters atomically and return per-camera counter."""
+        with self.frame_count_lock:
+            self.frame_counts[camera_id] += 1
+            self.frame_count += 1
+            return self.frame_counts[camera_id]
     
     def detect_faces(self, frame):
         """
@@ -332,9 +346,9 @@ class FrameProcessor:
         Returns:
             dict: Processing results (None if frame skipped)
         """
-        # Frame skipping for performance
-        self.frame_count += 1
-        if self.frame_skip > 1 and (self.frame_count % self.frame_skip) != 0:
+        # Frame skipping for performance (per camera to avoid cross-camera interference).
+        camera_frame_count = self._next_frame_count(camera_id)
+        if self.frame_skip > 1 and (camera_frame_count % self.frame_skip) != 0:
             return None
         
         start_time = time.time()
@@ -498,13 +512,18 @@ class FrameProcessor:
     
     def get_config(self):
         """Get current configuration"""
+        with self.frame_count_lock:
+            frame_counts = dict(self.frame_counts)
+            frame_count = self.frame_count
+
         config = {
             'use_insightface': self.use_insightface,
             'insightface_available': INSIGHTFACE_AVAILABLE,
             'det_threshold': self.det_threshold,
             'recognition_threshold': self.recognition_threshold,
             'frame_skip': self.frame_skip,
-            'frame_count': self.frame_count
+            'frame_count': frame_count,
+            'frame_counts': frame_counts,
         }
         
         if self.use_insightface and self.pipeline:

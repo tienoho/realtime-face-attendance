@@ -138,10 +138,21 @@ class RTSPCamera(BaseCamera):
     def _build_url(self):
         """Build RTSP URL with credentials if provided"""
         if self.username and self.password:
-            # Insert credentials into URL
-            pattern = r'(rtsp://)(.*?)@'
-            replacement = f'rtsp://{self.username}:{self.password}@'
-            self.url = re.sub(pattern, replacement, self.url)
+            if '@' in self.url:
+                # Replace existing credentials in URL
+                pattern = r'(rtsp://)(.*?)@'
+                replacement = f'rtsp://{self.username}:{self.password}@'
+                self.url = re.sub(pattern, replacement, self.url)
+            elif self.url.startswith('rtsp://'):
+                # Inject credentials when URL does not have them
+                self.url = self.url.replace('rtsp://', f'rtsp://{self.username}:{self.password}@', 1)
+
+    @staticmethod
+    def _safe_url_for_log(url: str) -> str:
+        """Redact credentials in RTSP URLs before logging."""
+        if not isinstance(url, str):
+            return ""
+        return re.sub(r'rtsp://[^/@]+@', 'rtsp://***:***@', url)
     
     def connect(self):
         """Connect to RTSP stream"""
@@ -156,7 +167,9 @@ class RTSPCamera(BaseCamera):
                 ret, frame = self.cap.read()
                 if ret:
                     self.is_connected = True
-                    logger.info(f"RTSP Camera {self.camera_id} connected: {self.url}")
+                    logger.info(
+                        f"RTSP Camera {self.camera_id} connected: {self._safe_url_for_log(self.url)}"
+                    )
                     return True
             
             logger.error(f"Failed to open RTSP stream {self.camera_id}")

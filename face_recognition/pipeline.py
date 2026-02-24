@@ -13,6 +13,7 @@ from typing import List, Optional, Dict, Any, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from . import config
 from .detector import FaceDetector, DetectedFace
 from .recognizer import FaceEmbedder
 from .vector_store import VectorStore
@@ -55,10 +56,10 @@ class FaceRecognitionPipeline:
     and recognition to minimize memory usage.
     """
     
-    # Default configuration
-    DEFAULT_DET_THRESHOLD = 0.5
-    DEFAULT_RECOGNITION_THRESHOLD = 0.6
-    DEFAULT_ATTENDANCE_COOLDOWN = 300  # 5 minutes
+    # Default configuration from config
+    DEFAULT_DET_THRESHOLD = config.DETECTOR_THRESHOLD
+    DEFAULT_RECOGNITION_THRESHOLD = config.RECOGNITION_THRESHOLD
+    DEFAULT_ATTENDANCE_COOLDOWN = config.ATTENDANCE_COOLDOWN
     
     def __init__(
         self,

@@ -7,7 +7,6 @@ import {
   Card,
   CardMedia,
   Grid,
-  CircularProgress,
   Alert,
   LinearProgress,
 } from '@mui/material'
@@ -40,7 +39,6 @@ export default function FaceCapture({
   const [isCapturing, setIsCapturing] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user')
-  const [countdown, setCountdown] = useState<number | null>(null)
   const captureIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // Initialize camera

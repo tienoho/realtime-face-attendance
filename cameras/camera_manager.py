@@ -6,6 +6,7 @@ import threading
 import queue
 import logging
 import time
+import re
 from collections import defaultdict
 from .camera_factory import CameraFactory
 
@@ -129,7 +130,7 @@ class CameraManager:
             if camera_id not in self.cameras:
                 logger.error(f"Camera {camera_id} not found")
                 return False
-            
+
             # Create stop event for this camera
             stop_event = threading.Event()
             self.stop_flags[camera_id] = stop_event
@@ -140,6 +141,9 @@ class CameraManager:
                 logger.error(f"Failed to connect to camera {camera_id}")
                 del self.stop_flags[camera_id]
                 return False
+
+            # Ensure capture loop can run when starting individual cameras.
+            self.running = True
             
             # Start capture thread
             thread = threading.Thread(
@@ -169,6 +173,10 @@ class CameraManager:
         # Clean up stop flag
         if camera_id in self.stop_flags:
             del self.stop_flags[camera_id]
+
+        # If there are no active capture threads, mark manager as not running.
+        if not self.capture_threads:
+            self.running = False
         
         logger.info(f"Camera {camera_id} stopped")
 
@@ -323,6 +331,25 @@ class CameraManager:
     def register_frame_callback(self, callback):
         """Register a callback for each frame"""
         self.frame_callbacks.append(callback)
+
+    @staticmethod
+    def _sanitize_config(config):
+        """Redact sensitive fields before returning camera config to clients."""
+        if not isinstance(config, dict):
+            return {}
+
+        redacted = dict(config)
+        sensitive_keys = {'password', 'passwd', 'secret', 'token', 'api_key', 'access_key'}
+        for key in list(redacted.keys()):
+            key_lower = str(key).lower()
+            if key_lower in sensitive_keys:
+                redacted[key] = '***'
+                continue
+
+            # Also redact credentials embedded in stream URLs.
+            if key_lower in {'url', 'stream_url', 'rtsp_url'} and isinstance(redacted[key], str):
+                redacted[key] = re.sub(r'://[^/@]+@', '://***:***@', redacted[key])
+        return redacted
     
     def get_camera_info(self, camera_id):
         """Get information about a camera"""
@@ -336,7 +363,7 @@ class CameraManager:
             'camera_id': camera_id,
             'type': camera.__class__.__name__,
             'connected': camera.is_connected,
-            'config': self.camera_configs[camera_id],
+            'config': self._sanitize_config(self.camera_configs[camera_id]),
             'stats': stats
         }
     

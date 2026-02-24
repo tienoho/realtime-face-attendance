@@ -13,6 +13,8 @@ import threading
 from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass, field
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -38,16 +40,15 @@ class VectorStore:
     InsightFace buffalo_s/buffalo_l models output 512-dimensional embeddings.
     """
     
-    # Embedding dimension for InsightFace models (buffalo_s, buffalo_l)
-    # This should match the output dimension of the embedder
-    EMBEDDING_DIM = 512
+    # Embedding dimension from config
+    EMBEDDING_DIM = config.EMBEDDING_DIM
     
     def __init__(
         self,
-        index_path: str = "models/faiss_index.bin",
-        use_gpu: bool = False,
-        nlist: int = 100,  # Number of clusters for IVF
-        nprobe: int = 10   # Number of clusters to search
+        index_path: str = None,
+        use_gpu: bool = None,
+        nlist: int = None,
+        nprobe: int = None
     ):
         """
         Initialize the vector store.
@@ -58,13 +59,14 @@ class VectorStore:
             nlist: Number of clusters for IVF index
             nprobe: Number of clusters to search
         """
-        self.index_path = index_path
-        self.use_gpu = use_gpu
-        self.nlist = nlist
-        self.nprobe = nprobe
+        self.index_path = index_path if index_path is not None else config.INDEX_PATH
+        self.use_gpu = use_gpu if use_gpu is not None else config.USE_GPU
+        self.nlist = nlist if nlist is not None else config.IVF_NLIST
+        self.nprobe = nprobe if nprobe is not None else config.IVF_NPROBE
         
         # Thread safety
-        self._lock = threading.Lock()
+        # Re-entrant lock is required because add()/update() may call each other.
+        self._lock = threading.RLock()
         
         self._index = None
         self._student_ids: List[str] = []
@@ -72,6 +74,16 @@ class VectorStore:
         self._embeddings: List[np.ndarray] = []
         
         self._load_index()
+
+    @staticmethod
+    def _normalize_embedding(embedding: np.ndarray) -> Optional[np.ndarray]:
+        """Normalize embedding safely; return None for invalid vectors."""
+        if embedding is None:
+            return None
+        norm = np.linalg.norm(embedding)
+        if norm <= 0:
+            return None
+        return embedding / norm
     
     def _create_index(self):
         """Create a new FAISS index."""
@@ -158,7 +170,10 @@ class VectorStore:
                 return False
             
             # Normalize embedding
-            emb = embedding / np.linalg.norm(embedding)
+            emb = self._normalize_embedding(embedding)
+            if emb is None:
+                logger.error("Invalid embedding vector: zero norm")
+                return False
             
             # Check if student_id already exists
             if student_id in self._student_ids:
@@ -197,7 +212,10 @@ class VectorStore:
             self._student_names[student_id] = name
             
             idx = self._student_ids.index(student_id)
-            emb = embedding / np.linalg.norm(embedding)
+            emb = self._normalize_embedding(embedding)
+            if emb is None:
+                logger.error("Invalid embedding vector: zero norm")
+                return False
             self._embeddings[idx] = emb
             
             # Replace in index (FAISS workaround)
@@ -259,7 +277,10 @@ class VectorStore:
                 return []
             
             # Normalize query
-            query = embedding / np.linalg.norm(embedding)
+            query = self._normalize_embedding(embedding)
+            if query is None:
+                logger.warning("Invalid query embedding: zero norm")
+                return []
             
             try:
                 # Search
@@ -290,28 +311,32 @@ class VectorStore:
     
     def get_stats(self) -> Dict[str, Any]:
         """Get statistics about the index."""
-        return {
-            "total_faces": len(self._student_ids),
-            "embedding_dim": self.EMBEDDING_DIM,
-            "index_type": type(self._index).__name__,
-            "use_gpu": self.use_gpu
-        }
+        with self._lock:
+            index_type = type(self._index).__name__ if self._index is not None else "None"
+            return {
+                "total_faces": len(self._student_ids),
+                "embedding_dim": self.EMBEDDING_DIM,
+                "index_type": index_type,
+                "use_gpu": self.use_gpu
+            }
     
     def clear(self) -> bool:
         """Clear all embeddings."""
-        self._index.reset()
-        self._student_ids = []
-        self._student_names = {}
-        self._embeddings = []
-        self._save_index()
-        logger.info("Cleared FAISS index")
-        return True
+        with self._lock:
+            self._index.reset()
+            self._student_ids = []
+            self._student_names = {}
+            self._embeddings = []
+            self._save_index()
+            logger.info("Cleared FAISS index")
+            return True
     
     def __len__(self) -> int:
-        return len(self._student_ids)
+        with self._lock:
+            return len(self._student_ids)
     
     def __repr__(self) -> str:
-        return f"VectorStore(faces={len(self._student_ids)}, dim={self.EMBEDDING_DIM})"
+        return f"VectorStore(faces={len(self)}, dim={self.EMBEDDING_DIM})"
 
 
 def test_vector_store():

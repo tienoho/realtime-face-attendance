@@ -12,6 +12,8 @@ import numpy as np
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -40,7 +42,8 @@ class FaceEmbedder:
     loading model multiple times (saves memory).
     """
     
-    EMBEDDING_DIM = 512
+    # Embedding dimension from config
+    EMBEDDING_DIM = config.EMBEDDING_DIM
     
     def __init__(
         self,
@@ -56,7 +59,7 @@ class FaceEmbedder:
             model_name: InsightFace model name (used if app is None)
             providers: Execution providers
         """
-        self.model_name = model_name or 'buffalo_s'  # Use smaller model
+        self.model_name = model_name if model_name is not None else config.DETECTOR_MODEL
         self.providers = providers or ['CPUExecutionProvider']
         
         # Reuse existing app or create new one

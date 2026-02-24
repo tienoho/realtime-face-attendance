@@ -4,6 +4,7 @@ import sys
 import base64
 import json
 import logging
+from logging.handlers import RotatingFileHandler
 import re
 import threading
 import time
@@ -18,13 +19,31 @@ import psycopg2  # For PostgreSQL support
 import jwt
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 from flask import Flask, request, jsonify, render_template
-from flask_socketio import SocketIO, emit, disconnect
+from flask_socketio import SocketIO, emit
 from flask_cors import CORS
-from werkzeug.security import check_password_hash, generate_password_hash
+from werkzeug.security import check_password_hash
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import BadRequest, Unauthorized, InternalServerError
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+
+# Module logger must exist before any optional imports use it.
+logger = logging.getLogger(__name__)
+
+# Add deployment directory and project root to path as early as possible.
+# This allows optional sibling imports (e.g. face_recognition.*) in script mode.
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
+# MediaPipe import (used by legacy detection path)
+try:
+    import mediapipe as mp
+except ImportError:
+    mp = None
 
 # InsightFace imports
 try:
@@ -40,9 +59,6 @@ except ImportError:
     logger.warning("Data augmentation module not found")
     DataAugmentor = None
     augment_face_batch = None
-
-# Add parent directory to path for camera imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # ============================================================
 # DATABASE TYPE SELECTION
@@ -71,19 +87,28 @@ else:
 app = Flask(__name__)
 
 # CORS configuration - require explicit origins in production
-CORS_CONFIG = os.getenv('CORS_ORIGINS', '')
+CORS_CONFIG = os.getenv('CORS_ORIGINS', '').strip()
 if not CORS_CONFIG:
-    # In production, CORS_ORIGINS must be set. For development, allow common localhost ports.
-    if os.getenv('FLASK_ENV') == 'development':
-        CORS(app, resources={r"/api/*": {"origins": "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"}})
-    else:
+    # Require explicit CORS origins only in production; default localhost origins in dev/test/local.
+    flask_env = (os.getenv('FLASK_ENV') or os.getenv('ENV') or '').strip().lower()
+    if flask_env in {'production', 'prod'}:
         raise ValueError("CORS_ORIGINS environment variable must be set in production")
+    else:
+        cors_origins = [
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:5173",
+        ]
 else:
-    origins = CORS_CONFIG.split(',')
-    CORS(app, resources={r"/api/*": {"origins": origins}})
+    cors_origins = [origin.strip() for origin in CORS_CONFIG.split(',') if origin.strip()]
+    if not cors_origins:
+        raise ValueError("CORS_ORIGINS contains no valid origins")
+
+CORS(app, resources={r"/api/*": {"origins": cors_origins}})
 
 # SocketIO setup
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins=cors_origins, async_mode='eventlet')
 
 # ============================================================
 # CONFIGURATION
@@ -112,6 +137,7 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 app.config['ALLOWED_EXTENSIONS'] = {'png', 'jpg', 'jpeg'}
 app.config['MODEL_PATH'] = os.getenv('MODEL_PATH', 'model/Trainer.yml')
 app.config['CASCADE_PATH'] = os.getenv('CASCADE_PATH', 'model/Haarcascade.xml')
+app.config['LABEL_MAP_PATH'] = os.getenv('LABEL_MAP_PATH', 'model/label_map.json')
 
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
@@ -140,12 +166,10 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('api.log', maxBytes=10*1024*1024, backupCount=5),
+        RotatingFileHandler('api.log', maxBytes=10 * 1024 * 1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
-
 # ============================================================
 # MODEL CACHE
 # ============================================================
@@ -153,8 +177,19 @@ logger = logging.getLogger(__name__)
 _model_cache = {
     'face_detector': None,
     'face_recognizer': None,
-    'mp_face_detection': None
+    'mp_face_detection': None,
+    'label_map': None,
 }
+_mediapipe_unavailable_logged = False
+
+# Validation patterns and blocked tokens
+STUDENT_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_-]+$')
+NAME_PATTERN = re.compile(r'^[a-zA-Z\s]+$')
+SUBJECT_PATTERN = re.compile(r'^[a-zA-Z0-9\s_-]+$')
+FORBIDDEN_STUDENT_ID_TOKENS = (
+    ';', '--', '/*', '*/', 'xp_', 'sp_', 'exec', 'execute', 'insert', 'delete', 'update', 'drop'
+)
+DANGEROUS_NAME_TOKENS = ('<', '>', '"', "'", '&', ';', 'script', 'javascript')
 
 def get_cached_face_detector():
     if _model_cache['face_detector'] is None:
@@ -181,7 +216,28 @@ def get_cached_face_recognizer():
                 logger.warning(f"Could not load face recognition model: {e}")
     return _model_cache['face_recognizer']
 
+def get_cached_label_map():
+    if _model_cache['label_map'] is None:
+        label_map_path = app.config.get('LABEL_MAP_PATH')
+        if label_map_path and os.path.exists(label_map_path):
+            try:
+                with open(label_map_path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    _model_cache['label_map'] = {str(k): str(v) for k, v in loaded.items()}
+                else:
+                    logger.warning(f"Invalid label map format in {label_map_path}, expected object")
+                    _model_cache['label_map'] = {}
+            except Exception as e:
+                logger.warning(f"Could not load label map from {label_map_path}: {e}")
+                _model_cache['label_map'] = {}
+        else:
+            _model_cache['label_map'] = {}
+    return _model_cache['label_map']
+
 def get_mediapipe_detector():
+    if mp is None:
+        raise RuntimeError("MediaPipe is not installed")
     if _model_cache['mp_face_detection'] is None:
         _model_cache['mp_face_detection'] = mp.solutions.face_detection
     return _model_cache['mp_face_detection']
@@ -190,37 +246,10 @@ def get_mediapipe_detector():
 # CAMERA MANAGER (Realtime Support)
 # ============================================================
 
-try:
-    from cameras.camera_manager import CameraManager
-    from cameras.frame_processor import FrameProcessor, AdaptiveFrameProcessor
-    from cameras.attendance_engine import AttendanceEngine
-    
-    camera_manager = CameraManager(max_cameras=16, frame_queue_size=5)
-    
-    # Initialize frame processor with InsightFace (recommended)
-    # Set use_insightface=False to use legacy detection
-    frame_processor = FrameProcessor(
-        num_workers=4,
-        use_insightface=True,
-        det_threshold=0.5,
-        recognition_threshold=0.6
-    )
-    
-    # Initialize attendance engine
-    attendance_engine = AttendanceEngine(dedup_window=300)
-    
-    camera_manager.register_frame_callback(on_frame_captured)
-    camera_manager.register_frame_callback(on_frame_for_streaming)
-    frame_processor.register_detection_callback(on_faces_detected)
-    frame_processor.register_recognition_callback(on_faces_recognized)
-    
-    CAMERA_SYSTEM_AVAILABLE = True
-except ImportError as e:
-    logger.warning(f"Camera system not available: {e}")
-    CAMERA_SYSTEM_AVAILABLE = False
-    camera_manager = None
-    frame_processor = None
-    attendance_engine = None
+camera_manager = None
+frame_processor = None
+attendance_engine = None
+CAMERA_SYSTEM_AVAILABLE = False
 
 # Connected clients for streaming
 connected_clients = set()
@@ -243,52 +272,81 @@ FRAME_RESIZE_WIDTH = 640
 # Use get_db_connection from the imported database module (mysql or postgresql)
 
 def allowed_file(filename):
+    if not isinstance(filename, str) or not filename:
+        return False
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
 def validate_student_id(student_id):
+    if not isinstance(student_id, str):
+        return False, "Student ID must be 3-50 characters"
+    student_id = student_id.strip()
     if not student_id or len(student_id) < 3 or len(student_id) > 50:
         return False, "Student ID must be 3-50 characters"
-    if not re.match(r'^[a-zA-Z0-9_-]+$', student_id):
+    if not STUDENT_ID_PATTERN.match(student_id):
         return False, "Student ID can only contain alphanumeric, underscore, hyphen"
-    forbidden = [';', '--', '/*', '*/', 'xp_', 'sp_', 'exec', 'execute', 'insert', 'delete', 'update', 'drop']
-    for word in forbidden:
-        if word.lower() in student_id.lower():
+    student_id_lower = student_id.lower()
+    for word in FORBIDDEN_STUDENT_ID_TOKENS:
+        if word in student_id_lower:
             return False, "Student ID contains forbidden characters"
     return True, None
 
 def validate_name(name):
+    if not isinstance(name, str):
+        return False, "Name must be 2-100 characters"
+    name = name.strip()
     if not name or len(name) < 2 or len(name) > 100:
         return False, "Name must be 2-100 characters"
-    if not re.match(r'^[a-zA-Z\s]+$', name):
+    if not NAME_PATTERN.match(name):
         return False, "Name can only contain letters and spaces"
-    dangerous_chars = ['<', '>', '"', "'", '&', ';', 'script', 'javascript']
-    for char in dangerous_chars:
-        if char in name.lower():
+    name_lower = name.lower()
+    for char in DANGEROUS_NAME_TOKENS:
+        if char in name_lower:
             return False, "Name contains forbidden characters"
     return True, None
 
 def validate_subject(subject):
+    if not isinstance(subject, str):
+        return False, "Subject must be 2-100 characters"
+    subject = subject.strip()
     if not subject or len(subject) < 2 or len(subject) > 100:
         return False, "Subject must be 2-100 characters"
-    if not re.match(r'^[a-zA-Z0-9\s_-]+$', subject):
+    if not SUBJECT_PATTERN.match(subject):
         return False, "Subject can only contain letters, numbers, spaces, underscore, hyphen"
     return True, None
 
 def detect_faces_mediapipe(image):
-    mp_face_detection = get_mediapipe_detector()
-    with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
-        results = face_detection.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
-        if results.detections:
-            boxes = []
-            h, w, _ = image.shape
-            for detection in results.detections:
-                bbox = detection.location_data.relative_bounding_box
-                x = int(bbox.xmin * w)
-                y = int(bbox.ymin * h)
-                width = int(bbox.width * w)
-                height = int(bbox.height * h)
-                boxes.append((x, y, width, height))
-            return boxes
+    global _mediapipe_unavailable_logged
+
+    if image is None or image.size == 0:
+        return []
+
+    if mp is None:
+        if not _mediapipe_unavailable_logged:
+            logger.warning("MediaPipe is not installed. Falling back to Haar Cascade face detection.")
+            _mediapipe_unavailable_logged = True
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return detect_faces_haar(gray)
+
+    try:
+        mp_face_detection = get_mediapipe_detector()
+        with mp_face_detection.FaceDetection(model_selection=1, min_detection_confidence=0.5) as face_detection:
+            results = face_detection.process(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+            if results.detections:
+                boxes = []
+                h, w, _ = image.shape
+                for detection in results.detections:
+                    bbox = detection.location_data.relative_bounding_box
+                    x = int(bbox.xmin * w)
+                    y = int(bbox.ymin * h)
+                    width = int(bbox.width * w)
+                    height = int(bbox.height * h)
+                    boxes.append((x, y, width, height))
+                return boxes
+    except Exception as e:
+        logger.warning(f"MediaPipe detection failed, falling back to Haar Cascade: {e}")
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return detect_faces_haar(gray)
+
     return []
 
 def detect_faces_haar(gray_image):
@@ -302,7 +360,17 @@ def recognize_face(gray_face):
         return None, 0
     try:
         label, confidence = recognizer.predict(gray_face)
-        return label, confidence
+        label_map = get_cached_label_map()
+        if not label_map:
+            logger.error("Label map is unavailable. Rejecting LBPH recognition result.")
+            return None, 0
+
+        student_id = label_map.get(str(label))
+        if not student_id:
+            logger.error(f"Predicted label {label} is not in label map. Rejecting recognition result.")
+            return None, 0
+
+        return student_id, confidence
     except Exception as e:
         logger.error(f"Face recognition error: {e}")
         return None, 0
@@ -385,6 +453,51 @@ def on_frame_for_streaming(camera_id, frame):
     except Exception as e:
         logger.error(f"Error encoding frame for streaming: {e}")
 
+
+def initialize_camera_system():
+    """Initialize camera manager and processing callbacks."""
+    global camera_manager, frame_processor, attendance_engine, CAMERA_SYSTEM_AVAILABLE
+
+    try:
+        from cameras.camera_manager import CameraManager
+        from cameras.frame_processor import FrameProcessor
+        from cameras.attendance_engine import AttendanceEngine
+
+        camera_manager = CameraManager(max_cameras=16, frame_queue_size=5)
+        frame_processor = FrameProcessor(
+            num_workers=4,
+            use_insightface=True,
+            det_threshold=0.5,
+            recognition_threshold=0.6
+        )
+        attendance_engine = AttendanceEngine(dedup_window=300)
+
+        camera_manager.register_frame_callback(on_frame_captured)
+        camera_manager.register_frame_callback(on_frame_for_streaming)
+        frame_processor.register_detection_callback(on_faces_detected)
+        frame_processor.register_recognition_callback(on_faces_recognized)
+
+        CAMERA_SYSTEM_AVAILABLE = True
+        logger.info("Camera system initialized successfully")
+    except ImportError as e:
+        logger.warning(f"Camera system dependencies are not available: {e}")
+        CAMERA_SYSTEM_AVAILABLE = False
+        camera_manager = None
+        frame_processor = None
+        attendance_engine = None
+    except RuntimeError as e:
+        logger.warning(f"Camera system disabled due to runtime dependency issue: {e}")
+        CAMERA_SYSTEM_AVAILABLE = False
+        camera_manager = None
+        frame_processor = None
+        attendance_engine = None
+    except Exception:
+        logger.exception("Unexpected error while initializing camera system")
+        raise
+
+
+initialize_camera_system()
+
 # ============================================================
 # MODEL TRAINING
 # ============================================================
@@ -401,23 +514,23 @@ def train_face_recognition_model():
     try:
         training_folder = app.config['UPLOAD_FOLDER']
         model_path = app.config['MODEL_PATH']
+        label_map_path = app.config['LABEL_MAP_PATH']
         
         # Get all image files
         faces = []
         labels = []
+        label_to_student_id = {}
         
         # Walk through all subdirectories (each student has their own folder)
-        for student_id in os.listdir(training_folder):
+        student_ids = sorted([
+            student_id for student_id in os.listdir(training_folder)
+            if os.path.isdir(os.path.join(training_folder, student_id))
+        ])
+
+        for idx, student_id in enumerate(student_ids, start=1):
             student_path = os.path.join(training_folder, student_id)
-            if not os.path.isdir(student_path):
-                continue
-            
-            # Try to extract numeric label from student_id
-            try:
-                # Use the student_id as-is or convert to numeric
-                label = int(student_id) if student_id.isdigit() else hash(student_id) % 10000
-            except (ValueError, TypeError):
-                label = hash(student_id) % 10000
+            label = idx
+            label_to_student_id[label] = student_id
             
             # Load all images for this student
             for img_name in os.listdir(student_path):
@@ -444,10 +557,19 @@ def train_face_recognition_model():
         
         # Save the model
         recognizer.save(model_path)
+
+        # Persist label -> student_id mapping for inference.
+        label_map_dir = os.path.dirname(label_map_path)
+        if label_map_dir:
+            os.makedirs(label_map_dir, exist_ok=True)
+        serializable_label_map = {str(k): v for k, v in label_to_student_id.items()}
+        with open(label_map_path, 'w', encoding='utf-8') as f:
+            json.dump(serializable_label_map, f, indent=2)
         
         # Update the cached recognizer
         global _model_cache
         _model_cache['face_recognizer'] = recognizer
+        _model_cache['label_map'] = serializable_label_map
         
         logger.info(f"Model trained successfully with {len(faces)} images")
         
@@ -455,7 +577,7 @@ def train_face_recognition_model():
             'status': 'success',
             'message': 'Model trained successfully',
             'images_trained': len(faces),
-            'unique_labels': len(set(labels))
+            'unique_labels': len(label_to_student_id)
         }
         
     except Exception as e:
@@ -475,198 +597,15 @@ def train_model_async():
 
 
 # ============================================================
-# AUTHENTICATION
+# PIPELINE ACCESSORS (USED BY SERVICE LAYER)
 # ============================================================
 
-def token_required(f):
-    @wraps(f)
-    def decorator(*args, **kwargs):
-        token = request.headers.get('Authorization')
-        if not token:
-            return jsonify({'message': 'Token is missing'}), 401
-
-        try:
-            if token.startswith('Bearer '):
-                token = token.split(" ")[1]
-
-            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
-            current_user = data['user_id']
-        except ExpiredSignatureError:
-            return jsonify({'message': 'Token has expired'}), 401
-        except InvalidTokenError:
-            return jsonify({'message': 'Invalid token'}), 401
-        except Exception as e:
-            logger.error(f"Token validation error: {str(e)}")
-            return jsonify({'message': 'Token validation failed'}), 401
-
-        return f(current_user, *args, **kwargs)
-    return decorator
-
-# ============================================================
-# REST API ENDPOINTS
-# ============================================================
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/api/login', methods=['POST'])
-@limiter.limit("10 per minute")
-def login():
-    try:
-        auth = request.get_json()
-        if not auth or not auth.get('username') or not auth.get('password'):
-            return jsonify({'message': 'Missing credentials'}), 400
-
-        username = auth.get('username')
-        password = auth.get('password')
-
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id, username, password_hash FROM users WHERE username = %s', (username,))
-            user = cursor.fetchone()
-
-            if not user:
-                return jsonify({'message': 'Invalid credentials'}), 401
-            
-            stored_hash = user[2]
-            # Always use password hash verification - reject plaintext hashes
-            if not stored_hash.startswith('$2b'):
-                logger.error(f"User {username} has insecure plaintext password hash")
-                return jsonify({'message': 'Invalid credentials'}), 401
-            
-            if not check_password_hash(stored_hash, password):
-                return jsonify({'message': 'Invalid credentials'}), 401
-
-            token = jwt.encode({
-                'user_id': user[0],
-                'username': user[1],
-                'exp': datetime.utcnow() + timedelta(hours=24)
-            }, app.config['SECRET_KEY'], algorithm='HS256')
-
-            logger.info(f"User {username} logged in successfully")
-            return jsonify({
-                'token': token,
-                'user_id': user[0],
-                'username': user[1]
-            }), 200
-            
-    except (pymysql.Error, psycopg2.Error) as e:
-        logger.error(f"Database error during login: {e}")
-        return jsonify({'message': 'Database error'}), 500
-    except Exception as e:
-        logger.error(f"Login error: {str(e)}")
-        return jsonify({'message': 'Server error'}), 500
-
-@app.route('/api/register-student', methods=['POST'])
-@token_required
-def register_student(current_user):
-    try:
-        if 'file' not in request.files:
-            return jsonify({'message': 'No file provided'}), 400
-
-        student_id = request.form.get('student_id', '').strip()
-        name = request.form.get('name', '').strip()
-        subject = request.form.get('subject', 'General').strip()
-
-        valid, error = validate_student_id(student_id)
-        if not valid:
-            return jsonify({'message': error}), 400
-
-        valid, error = validate_name(name)
-        if not valid:
-            return jsonify({'message': error}), 400
-
-        file = request.files['file']
-        if not allowed_file(file.filename):
-            return jsonify({'message': 'Invalid file type. Allowed: png, jpg, jpeg'}), 400
-
-        img_bytes = file.read()
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            return jsonify({'message': 'Invalid image file'}), 400
-
-        face_boxes = detect_faces_mediapipe(img)
-        
-        if not face_boxes:
-            return jsonify({'message': 'No face detected in image'}), 400
-
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute('SELECT id FROM students WHERE student_id = %s', (student_id,))
-            if cursor.fetchone():
-                return jsonify({'message': f'Student ID {student_id} already exists'}), 409
-
-            cursor.execute(
-                'INSERT INTO students (student_id, name) VALUES (%s, %s)',
-                (student_id, name)
-            )
-            
-            student_folder = os.path.join(app.config['UPLOAD_FOLDER'], student_id)
-            os.makedirs(student_folder, exist_ok=True)
-            
-            saved_count = 0
-            for i, (x, y, w, h) in enumerate(face_boxes[:1]):
-                pad = 20
-                x1 = max(0, x - pad)
-                y1 = max(0, y - pad)
-                x2 = min(img.shape[1], x + w + pad)
-                y2 = min(img.shape[0], y + h + pad)
-                
-                face_img = img[y1:y2, x1:x2]
-                gray_face = cv2.cvtColor(face_img, cv2.COLOR_BGR2GRAY)
-                
-                img_filename = f"{student_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
-                img_path = os.path.join(student_folder, img_filename)
-                cv2.imwrite(img_path, gray_face)
-                
-                cursor.execute(
-                    'INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)',
-                    (student_id, img_path)
-                )
-                saved_count += 1
-
-            logger.info(f"Student {student_id} ({name}) registered with {saved_count} images")
-
-        # Auto-train model after successful registration
-        logger.info("Starting auto-training after student registration...")
-        training_result = train_face_recognition_model()
-        
-        if training_result['status'] == 'success':
-            logger.info(f"Auto-training completed: {training_result['images_trained']} images")
-        else:
-            logger.warning(f"Auto-training failed: {training_result['message']}")
-
-        return jsonify({
-            'message': 'Student registered successfully',
-            'student_id': student_id,
-            'name': name,
-            'images_saved': saved_count,
-            'model_trained': training_result['status'] == 'success',
-            'training_details': training_result
-        }), 201
-
-    except (pymysql.Error, psycopg2.Error) as e:
-        logger.error(f"Database error during registration: {e}")
-        return jsonify({'message': 'Database error'}), 500
-    except Exception as e:
-        logger.error(f"Registration error: {str(e)}")
-        return jsonify({'message': f'Server error: {str(e)}'}), 500
-
-# ============================================================
-# PHASE 2: MULTI-IMAGE REGISTRATION ENDPOINT
-# ============================================================
-
-# Initialize Face Recognition Pipeline (singleton)
 _face_pipeline = None
 _face_pipeline_lock = threading.Lock()
 
-# Initialize Face Detector (singleton) - for multi-image processing
 _face_detector = None
 _face_detector_lock = threading.Lock()
+
 
 def get_face_pipeline():
     """Get or create the face recognition pipeline."""
@@ -682,6 +621,7 @@ def get_face_pipeline():
                 return None
         return _face_pipeline
 
+
 def get_face_detector():
     """Get or create the face detector (cached for performance)."""
     global _face_detector
@@ -696,748 +636,65 @@ def get_face_detector():
                 _face_detector = None
         return _face_detector
 
-@app.route('/api/register-student-multi', methods=['POST'])
-@token_required
-def register_student_multi(current_user):
-    """
-    Register a student with multiple images.
-    
-    Accepts:
-    - student_id: Student ID
-    - name: Student name
-    - images: Multiple image files (at least 5 recommended)
-    - apply_augmentation: Whether to apply data augmentation
-    
-    Returns:
-    - Student registration result with training details
-    """
-    try:
-        # Check for images
-        files = request.files.getlist('images')
-        if not files or len(files) == 0:
-            return jsonify({'message': 'No images provided'}), 400
-        
-        # Limit number of images to prevent DoS
-        if len(files) > 20:
-            return jsonify({'message': 'Maximum 20 images allowed'}), 400
-        
-        if len(files) < 3:
-            logger.warning(f"Only {len(files)} images provided, recommend at least 5-10")
-        
-        # Get form data
-        student_id = request.form.get('student_id', '').strip()
-        name = request.form.get('name', '').strip()
-        apply_augmentation = request.form.get('apply_augmentation', 'true').lower() == 'true'
-        
-        # Validate inputs
-        valid, error = validate_student_id(student_id)
-        if not valid:
-            return jsonify({'message': error}), 400
-        
-        valid, error = validate_name(name)
-        if not valid:
-            return jsonify({'message': error}), 400
-        
-        # Check if student already exists
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id FROM students WHERE student_id = %s', (student_id,))
-            if cursor.fetchone():
-                return jsonify({'message': f'Student ID {student_id} already exists'}), 409
-        
-        # Process images using cached detector
-        valid_images = []
-        
-        # Use cached face detector
-        face_detector = get_face_detector()
-        if face_detector is None:
-            logger.warning("InsightFace not available, using MediaPipe fallback")
-        
-        for i, file in enumerate(files):
-            if not allowed_file(file.filename):
-                continue
-                
-            try:
-                # Read and decode image
-                img_bytes = file.read()
-                nparr = np.frombuffer(img_bytes, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-                
-                if img is None:
-                    logger.warning(f"Invalid image {i}: could not decode")
-                    continue
-                
-                # Detect face
-                if face_detector:
-                    faces = face_detector.detect(img)
-                    if faces:
-                        # Use largest face
-                        face = max(faces, key=lambda f: f.confidence)
-                        face_crop = face_detector.get_face_crop(img, face.bbox, padding=20)
-                        if face_crop is not None and face_crop.size > 0:
-                            valid_images.append(face_crop)
-                            logger.debug(f"Image {i}: face detected, crop size: {face_crop.shape}")
-                else:
-                    # Fallback to MediaPipe
-                    face_boxes = detect_faces_mediapipe(img)
-                    if face_boxes:
-                        x, y, w, h = face_boxes[0]
-                        pad = 20
-                        x1 = max(0, x - pad)
-                        y1 = max(0, y - pad)
-                        x2 = min(img.shape[1], x + w + pad)
-                        y2 = min(img.shape[0], y + h + pad)
-                        face_crop = img[y1:y2, x1:x2]
-                        if face_crop.size > 0:
-                            valid_images.append(face_crop)
-                            logger.debug(f"Image {i}: face detected (MediaPipe), crop size: {face_crop.shape}")
-                            
-            except Exception as img_err:
-                logger.warning(f"Error processing image {i}: {img_err}")
-        
-        if len(valid_images) < 1:
-            return jsonify({'message': 'No valid faces detected in any image'}), 400
-        
-        logger.info(f"Detected {len(valid_images)} valid face images from {len(files)} uploaded")
-        
-        # Apply data augmentation if requested
-        original_count = len(valid_images)
-        if apply_augmentation and augment_face_batch:
-            try:
-                # Target 10-15 images for good recognition
-                target = min(15, max(10, original_count * 3))
-                valid_images = augment_face_batch(valid_images, target_count=target)
-                logger.info(f"Applied augmentation: {original_count} -> {len(valid_images)} images")
-            except Exception as aug_err:
-                logger.warning(f"Augmentation failed: {aug_err}")
-        
-        # Save images to disk
-        student_folder = os.path.join(app.config['UPLOAD_FOLDER'], student_id)
-        os.makedirs(student_folder, exist_ok=True)
-        
-        saved_count = 0
-        for i, img in enumerate(valid_images):
-            try:
-                img_filename = f"{student_id}_{i:03d}.jpg"
-                img_path = os.path.join(student_folder, img_filename)
-                cv2.imwrite(img_path, img)
-                saved_count += 1
-            except Exception as save_err:
-                logger.warning(f"Failed to save image {i}: {save_err}")
-        
-        # Insert student into database
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO students (student_id, name) VALUES (%s, %s)',
-                (student_id, name)
-            )
-            
-            # Insert training image records
-            for i in range(saved_count):
-                img_path = os.path.join(student_folder, f"{student_id}_{i:03d}.jpg")
-                cursor.execute(
-                    'INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)',
-                    (student_id, img_path)
-                )
-        
-        # Register with Face Recognition Pipeline (FAISS)
-        pipeline_result = {'status': 'not_available'}
-        pipeline = get_face_pipeline()
-        
-        if pipeline:
-            try:
-                # Use original images (without augmentation) for embedding
-                result = pipeline.register_face(student_id, name, valid_images[:original_count])
-                pipeline_result = {
-                    'status': 'success' if result.get('success') else 'error',
-                    'message': result.get('message', ''),
-                    'images_processed': result.get('images_processed', 0)
-                }
-                logger.info(f"FAISS registration: {pipeline_result}")
-            except Exception as pipeline_err:
-                logger.error(f"Pipeline registration failed: {pipeline_err}")
-                pipeline_result = {'status': 'error', 'message': str(pipeline_err)}
-        
-        # Also train legacy LBPH model for backward compatibility (async)
-        def run_training():
-            try:
-                training_result = train_face_recognition_model()
-                if training_result.get('status') == 'success':
-                    logger.info(f"Background training completed: {training_result.get('images_trained')} images")
-                else:
-                    logger.warning(f"Background training failed: {training_result.get('message')}")
-            except Exception as train_err:
-                logger.error(f"Background training error: {train_err}")
-        
-        # Run training in background thread
-        threading.Thread(target=run_training, daemon=True).start()
-        
-        return jsonify({
-            'message': 'Student registered successfully',
-            'student_id': student_id,
-            'name': name,
-            'images_uploaded': len(files),
-            'faces_detected': len(valid_images),
-            'images_saved': saved_count,
-            'augmentation_applied': apply_augmentation,
-            'faiss_registration': pipeline_result,
-            'lbph_training': {'status': 'queued', 'message': 'Training started in background'}
-        }), 201
-        
-    except (pymysql.Error, psycopg2.Error) as e:
-        logger.error(f"Database error during multi-registration: {e}")
-        return jsonify({'message': 'Database error'}), 500
-    except Exception as e:
-        logger.error(f"Multi-registration error: {str(e)}")
-        return jsonify({'message': f'Server error: {str(e)}'}), 500
 
+# ============================================================
+# AUTHENTICATION
+# ============================================================
 
-@app.route('/api/register-face-capture', methods=['POST'])
-@token_required
-def register_face_capture(current_user):
-    """
-    Register a face from captured frame data (base64).
-    
-    Accepts:
-    - student_id: Student ID
-    - name: Student name
-    - image_data: Base64 encoded image
-    
-    Returns:
-    - Registration result
-    """
+def token_required(f):
     try:
-        data = request.get_json()
-        
-        if not data or not data.get('image_data'):
-            return jsonify({'message': 'No image data provided'}), 400
-        
-        student_id = data.get('student_id', '').strip()
-        name = data.get('name', '').strip()
-        image_data = data.get('image_data', '')
-        
-        # Validate
-        valid, error = validate_student_id(student_id)
-        if not valid:
-            return jsonify({'message': error}), 400
-        
-        valid, error = validate_name(name)
-        if not valid:
-            return jsonify({'message': error}), 400
-        
-        # Decode base64 image
+        from deployment.services.dto_service import error_response
+    except ImportError:
+        from services.dto_service import error_response
+
+    @wraps(f)
+    def decorator(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        if not token:
+            return error_response("TOKEN_MISSING", "Token is missing", 401)
+
         try:
-            # Remove data URL prefix if present
-            if ',' in image_data:
-                image_data = image_data.split(',')[1]
-            img_bytes = base64.b64decode(image_data)
-            nparr = np.frombuffer(img_bytes, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        except Exception as decode_err:
-            return jsonify({'message': f'Invalid image data: {decode_err}'}), 400
-        
-        if img is None:
-            return jsonify({'message': 'Could not decode image'}), 400
-        
-        # Detect face using cached detector
-        face_detector = get_face_detector()
-        face_crop = None
-        if face_detector:
-            faces = face_detector.detect(img)
-            if faces:
-                face = max(faces, key=lambda f: f.confidence)
-                face_crop = face_detector.get_face_crop(img, face.bbox, padding=20)
-        else:
-            face_boxes = detect_faces_mediapipe(img)
-            if face_boxes:
-                x, y, w, h = face_boxes[0]
-                pad = 20
-                x1, y1 = max(0, x - pad), max(0, y - pad)
-                x2, y2 = min(img.shape[1], x + w + pad), min(img.shape[0], y + h + pad)
-                face_crop = img[y1:y2, x1:x2]
-        
-        if face_crop is None or face_crop.size == 0:
-            return jsonify({'message': 'No face detected in image'}), 400
-        
-        # Check if student exists
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id FROM students WHERE student_id = %s', (student_id,))
-            exists = cursor.fetchone()
-            
-            if not exists:
-                cursor.execute('INSERT INTO students (student_id, name) VALUES (%s, %s)', (student_id, name))
-        
-        # Save image
-        student_folder = os.path.join(app.config['UPLOAD_FOLDER'], student_id)
-        os.makedirs(student_folder, exist_ok=True)
-        
-        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        img_filename = f"{student_id}_{timestamp}.jpg"
-        img_path = os.path.join(student_folder, img_filename)
-        cv2.imwrite(img_path, face_crop)
-        
-        # Record in DB
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                'INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)',
-                (student_id, img_path)
-            )
-        
-        # Register with FAISS if available
-        pipeline = get_face_pipeline()
-        faiss_result = {'status': 'not_available'}
-        
-        if pipeline:
-            try:
-                result = pipeline.register_face(student_id, name, [face_crop])
-                faiss_result = {
-                    'status': 'success' if result.get('success') else 'error',
-                    'message': result.get('message', '')
-                }
-            except Exception as e:
-                faiss_result = {'status': 'error', 'message': str(e)}
-        
-        return jsonify({
-            'message': 'Face captured successfully',
-            'student_id': student_id,
-            'name': name,
-            'image_path': img_path,
-            'faiss_registration': faiss_result
-        }), 201
-        
-    except Exception as e:
-        logger.error(f"Face capture error: {str(e)}")
-        return jsonify({'message': f'Server error: {str(e)}'}), 500
+            if token.startswith('Bearer '):
+                token = token.split(" ")[1]
 
+            data = jwt.decode(token, app.config['SECRET_KEY'], algorithms=["HS256"])
+            current_user = data['user_id']
+        except ExpiredSignatureError:
+            return error_response("TOKEN_EXPIRED", "Token has expired", 401)
+        except InvalidTokenError:
+            return error_response("TOKEN_INVALID", "Invalid token", 401)
+        except Exception as e:
+            logger.error(f"Token validation error: {str(e)}")
+            return error_response("TOKEN_VALIDATION_FAILED", "Token validation failed", 401)
 
-@app.route('/api/register-face', methods=['POST'])
-@token_required
-def register_face(current_user):
-    try:
-        if 'file' not in request.files:
-            return jsonify({'message': 'No file provided'}), 400
-
-        student_id = request.form.get('student_id', '').strip()
-        
-        file = request.files['file']
-        if not allowed_file(file.filename):
-            return jsonify({'message': 'Invalid file type'}), 400
-
-        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
-        filename = f"{student_id}_{timestamp}.jpg" if student_id else f"{timestamp}.jpg"
-        filename = secure_filename(filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(filepath)
-
-        image = cv2.imread(filepath)
-        face_boxes = detect_faces_mediapipe(image)
-        
-        if not face_boxes:
-            os.remove(filepath)
-            return jsonify({'message': 'No face detected'}), 400
-
-        if student_id:
-            try:
-                with get_db_connection() as conn:
-                    cursor = conn.cursor()
-                    # Use database-agnostic upsert logic
-                    cursor.execute('SELECT id FROM training_images WHERE student_id = %s', (student_id,))
-                    existing = cursor.fetchone()
-                    if existing:
-                        cursor.execute(
-                            'UPDATE training_images SET image_path = %s WHERE student_id = %s',
-                            (filepath, student_id)
-                        )
-                    else:
-                        cursor.execute(
-                            'INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)',
-                            (student_id, filepath)
-                        )
-            except Exception as db_err:
-                logger.warning(f"Could not save to database: {db_err}")
-
-        return jsonify({
-            'message': 'Face registered successfully',
-            'filename': filename,
-            'faces_detected': len(face_boxes)
-        }), 201
-        
-    except Exception as e:
-        logger.error(f"Face registration error: {str(e)}")
-        return jsonify({'message': f'Server error: {str(e)}'}), 500
-
-@app.route('/api/attendance', methods=['POST'])
-@token_required
-def mark_attendance(current_user):
-    try:
-        if 'file' not in request.files:
-            return jsonify({'message': 'No file provided'}), 400
-
-        subject = request.form.get('subject', 'General').strip()
-        
-        valid, error = validate_subject(subject)
-        if not valid:
-            return jsonify({'message': error}), 400
-        
-        file = request.files['file']
-        if not allowed_file(file.filename):
-            return jsonify({'message': 'Invalid file type'}), 400
-
-        img_bytes = file.read()
-        nparr = np.frombuffer(img_bytes, np.uint8)
-        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        if img is None:
-            return jsonify({'message': 'Invalid image file'}), 400
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        face_boxes = detect_faces_haar(gray)
-        
-        if not face_boxes:
-            return jsonify({'message': 'No face detected', 'status': 'no_face'}), 200
-
-        x, y, w, h = face_boxes[0]
-        face_roi = gray[y:y+h, x:x+w]
-
-        student_id, confidence = recognize_face(face_roi)
-        
-        if student_id is None or confidence >= 70:
-            return jsonify({
-                'message': 'Face not recognized',
-                'status': 'unknown',
-                'confidence': float(confidence) if confidence else None
-            }), 200
-
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            cursor.execute(
-                'SELECT student_id, name FROM students WHERE student_id = %s AND is_active = TRUE',
-                (student_id,)
-            )
-            student = cursor.fetchone()
-            
-            if not student:
-                return jsonify({'message': 'Student not found or inactive', 'status': 'not_found'}), 200
-
-            today = datetime.now().strftime('%Y-%m-%d')
-            cursor.execute(
-                '''SELECT id FROM attendance WHERE student_id = %s AND date = %s AND subject = %s''',
-                (student_id, today, subject)
-            )
-            
-            if cursor.fetchone():
-                return jsonify({
-                    'message': 'Already marked attendance today',
-                    'status': 'already_marked',
-                    'student_id': student[0],
-                    'name': student[1]
-                }), 200
-
-            now = datetime.now()
-            cursor.execute(
-                '''INSERT INTO attendance (student_id, enrollment, name, date, time, subject, status, confidence_score)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s)''',
-                (student_id, student_id, student[1], now.strftime('%Y-%m-%d'), 
-                 now.strftime('%H:%M:%S'), subject, 'Present', float(confidence))
-            )
-            
-            logger.info(f"Attendance marked: {student[1]} ({student_id}) for {subject}")
-
-        return jsonify({
-            'message': 'Attendance marked successfully',
-            'status': 'success',
-            'student_id': student[0],
-            'name': student[1],
-            'subject': subject,
-            'time': now.strftime('%H:%M:%S'),
-            'confidence': float(confidence)
-        }), 200
-
-    except (pymysql.Error, psycopg2.Error) as e:
-        logger.error(f"Database error during attendance: {e}")
-        return jsonify({'message': 'Database error'}), 500
-    except Exception as e:
-        logger.error(f"Attendance error: {str(e)}")
-        return jsonify({'message': f'Server error: {str(e)}'}), 500
-
-@app.route('/api/students', methods=['GET'])
-@token_required
-def get_students(current_user):
-    try:
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT student_id, name, is_active, created_at FROM students ORDER BY created_at DESC')
-            students = cursor.fetchall()
-            
-        return jsonify({
-            'students': [
-                {
-                    'student_id': s[0],
-                    'name': s[1],
-                    'is_active': bool(s[2]),
-                    'created_at': s[3].isoformat() if s[3] else None
-                }
-                for s in students
-            ]
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Error fetching students: {e}")
-        return jsonify({'message': 'Server error'}), 500
-
-@app.route('/api/attendance/report', methods=['GET'])
-@token_required
-def get_attendance_report(current_user):
-    try:
-        date = request.args.get('date', datetime.now().strftime('%Y-%m-%d'))
-        subject = request.args.get('subject', None)
-        
-        with get_db_connection() as conn:
-            cursor = conn.cursor()
-            
-            if subject:
-                cursor.execute(
-                    '''SELECT a.student_id, a.name, a.date, a.time, a.subject, a.status, a.confidence_score
-                       FROM attendance a WHERE a.date = %s AND a.subject = %s ORDER BY a.time''',
-                    (date, subject)
-                )
-            else:
-                cursor.execute(
-                    '''SELECT student_id, name, date, time, subject, status, confidence_score
-                       FROM attendance WHERE date = %s ORDER BY time''',
-                    (date,)
-                )
-            
-            records = cursor.fetchall()
-            
-        return jsonify({
-            'date': date,
-            'subject': subject,
-            'count': len(records),
-            'records': [
-                {
-                    'student_id': r[0], 'name': r[1], 'date': r[2], 'time': r[3],
-                    'subject': r[4], 'status': r[5], 'confidence': float(r[6]) if r[6] else None
-                }
-                for r in records
-            ]
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Error fetching report: {e}")
-        return jsonify({'message': 'Server error'}), 500
+        return f(current_user, *args, **kwargs)
+    return decorator
 
 # ============================================================
-# CAMERA API ENDPOINTS
+# REST API ENDPOINTS
 # ============================================================
 
-@app.route('/api/cameras', methods=['GET'])
-@token_required
-def get_cameras(current_user):
-    if not camera_manager:
-        return jsonify({'error': 'Camera system not available'}), 500
-    return jsonify(camera_manager.get_status())
+@app.route('/')
+def index():
+    return render_template('index.html')
 
-@app.route('/api/cameras', methods=['POST'])
-@token_required
-def add_camera(current_user):
-    if not camera_manager:
-        return jsonify({'error': 'Camera system not available'}), 500
-    
-    data = request.get_json()
-    camera_id = data.get('camera_id')
-    camera_type = data.get('type', 'usb')
-    
-    if not camera_id:
-        return jsonify({'error': 'camera_id is required'}), 400
-    
-    if camera_manager.add_camera(camera_id, camera_type, data):
-        camera_manager.start_camera(camera_id)
-        return jsonify({'message': f'Camera {camera_id} added', 'camera_id': camera_id})
-    
-    return jsonify({'error': 'Failed to add camera'}), 500
+# Register API blueprints (route layer)
+try:
+    from deployment.blueprints.auth_blueprint import create_auth_blueprint
+    from deployment.blueprints.students_blueprint import create_students_blueprint
+    from deployment.blueprints.attendance_blueprint import create_attendance_blueprint
+    from deployment.blueprints.cameras_blueprint import create_cameras_blueprint
+except ImportError:
+    from blueprints.auth_blueprint import create_auth_blueprint
+    from blueprints.students_blueprint import create_students_blueprint
+    from blueprints.attendance_blueprint import create_attendance_blueprint
+    from blueprints.cameras_blueprint import create_cameras_blueprint
 
-@app.route('/api/cameras/<camera_id>', methods=['DELETE'])
-@token_required
-def remove_camera(current_user, camera_id):
-    if not camera_manager:
-        return jsonify({'error': 'Camera system not available'}), 500
-    
-    if camera_manager.remove_camera(camera_id):
-        return jsonify({'message': f'Camera {camera_id} removed'})
-    
-    return jsonify({'error': 'Camera not found'}), 404
-
-@app.route('/api/cameras/<camera_id>/start', methods=['POST'])
-@token_required
-def start_camera(current_user, camera_id):
-    if not camera_manager:
-        return jsonify({'error': 'Camera system not available'}), 500
-    
-    if camera_manager.start_camera(camera_id):
-        return jsonify({'message': f'Camera {camera_id} started'})
-    
-    return jsonify({'error': 'Failed to start camera'}), 500
-
-@app.route('/api/cameras/<camera_id>/stop', methods=['POST'])
-@token_required
-def stop_camera(current_user, camera_id):
-    if not camera_manager:
-        return jsonify({'error': 'Camera system not available'}), 500
-    
-    camera_manager.stop_camera(camera_id)
-    return jsonify({'message': f'Camera {camera_id} stopped'})
-
-@app.route('/api/cameras/<camera_id>/frame', methods=['GET'])
-@token_required
-def get_camera_frame(current_user, camera_id):
-    if not camera_manager:
-        return jsonify({'error': 'Camera system not available'}), 500
-    
-    if camera_id not in camera_manager.cameras:
-        return jsonify({'error': 'Camera not found'}), 404
-    
-    frame, timestamp = camera_manager.get_latest_frame(camera_id)
-    
-    if frame is None:
-        return jsonify({'error': 'No frame available'}), 404
-    
-    encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 80]
-    _, buffer = cv2.imencode('.jpg', frame, encode_param)
-    frame_base64 = base64.b64encode(buffer).decode('utf-8')
-    
-    return jsonify({
-        'camera_id': camera_id,
-        'frame': f'data:image/jpeg;base64,{frame_base64}',
-        'timestamp': timestamp
-    })
-
-@app.route('/api/processing/stats', methods=['GET'])
-@token_required
-def get_processing_stats(current_user):
-    if not frame_processor:
-        return jsonify({})
-    return jsonify(frame_processor.get_stats())
-
-@app.route('/api/attendance/recent', methods=['GET'])
-@token_required
-def get_recent_attendance(current_user):
-    return jsonify({'records': [], 'count': 0})
-
-
-# ============================================================
-# PHASE 5: PROCESSING CONFIGURATION ENDPOINTS
-# ============================================================
-
-@app.route('/api/processing/config', methods=['GET'])
-@token_required
-def get_processing_config(current_user):
-    """
-    Get current frame processing configuration.
-    """
-    if not frame_processor:
-        return jsonify({'error': 'Frame processor not available'}), 500
-    
-    config = frame_processor.get_config()
-    return jsonify(config)
-
-
-@app.route('/api/processing/config', methods=['POST'])
-@token_required
-def update_processing_config(current_user):
-    """
-    Update frame processing configuration.
-    """
-    if not frame_processor:
-        return jsonify({'error': 'Frame processor not available'}), 500
-    
-    data = request.get_json()
-    if not data:
-        return jsonify({'message': 'No configuration provided'}), 400
-    
-    if 'det_threshold' in data:
-        threshold = float(data['det_threshold'])
-        if 0.0 <= threshold <= 1.0:
-            frame_processor.set_detection_threshold(threshold)
-        else:
-            return jsonify({'message': 'det_threshold must be between 0.0 and 1.0'}), 400
-    
-    if 'recognition_threshold' in data:
-        threshold = float(data['recognition_threshold'])
-        if 0.0 <= threshold <= 1.0:
-            frame_processor.set_recognition_threshold(threshold)
-        else:
-            return jsonify({'message': 'recognition_threshold must be between 0.0 and 1.0'}), 400
-    
-    if 'frame_skip' in data:
-        skip = int(data['frame_skip'])
-        if 1 <= skip <= 10:
-            frame_processor.set_frame_skip(skip)
-        else:
-            return jsonify({'message': 'frame_skip must be between 1 and 10'}), 400
-    
-    logger.info(f"Processing config updated: {data}")
-    
-    return jsonify({
-        'message': 'Configuration updated',
-        'config': frame_processor.get_config()
-    })
-
-
-@app.route('/api/streaming/config', methods=['GET'])
-@token_required
-def get_streaming_config(current_user):
-    """Get current streaming configuration"""
-    return jsonify({
-        'quality': ENCODE_QUALITY,
-        'fps': STREAM_FPS,
-        'resize_width': FRAME_RESIZE_WIDTH
-    })
-
-
-@app.route('/api/streaming/config', methods=['POST'])
-@token_required
-def update_streaming_config(current_user):
-    """Update streaming configuration"""
-    global ENCODE_QUALITY, STREAM_FPS, FRAME_RESIZE_WIDTH
-    
-    data = request.get_json()
-    if not data:
-        return jsonify({'message': 'No configuration provided'}), 400
-    
-    if 'quality' in data:
-        quality = int(data['quality'])
-        if 10 <= quality <= 100:
-            ENCODE_QUALITY = quality
-        else:
-            return jsonify({'message': 'Quality must be between 10 and 100'}), 400
-    
-    if 'fps' in data:
-        fps = int(data['fps'])
-        if 1 <= fps <= 30:
-            STREAM_FPS = fps
-        else:
-            return jsonify({'message': 'FPS must be between 1 and 30'}), 400
-    
-    if 'resize_width' in data:
-        width = int(data['resize_width'])
-        if 320 <= width <= 1920:
-            FRAME_RESIZE_WIDTH = width
-        else:
-            return jsonify({'message': 'Resize width must be between 320 and 1920'}), 400
-    
-    logger.info(f"Streaming config updated: quality={ENCODE_QUALITY}, fps={STREAM_FPS}, width={FRAME_RESIZE_WIDTH}")
-    
-    return jsonify({
-        'message': 'Configuration updated',
-        'quality': ENCODE_QUALITY,
-        'fps': STREAM_FPS,
-        'resize_width': FRAME_RESIZE_WIDTH
-    })
+runtime_module = sys.modules[__name__]
+app.register_blueprint(create_auth_blueprint(runtime_module))
+app.register_blueprint(create_students_blueprint(runtime_module))
+app.register_blueprint(create_attendance_blueprint(runtime_module))
+app.register_blueprint(create_cameras_blueprint(runtime_module))
 
 # ============================================================
 # WEBSOCKET EVENTS
@@ -1468,6 +725,10 @@ def handle_disconnect():
 
 @socketio.on('subscribe_camera')
 def handle_subscribe_camera(data):
+    if not isinstance(data, dict):
+        emit('stream_error', {'message': 'Invalid payload'})
+        return
+
     camera_id = data.get('camera_id')
     if camera_id:
         socketio.join_room(f'camera_{camera_id}')
@@ -1476,6 +737,10 @@ def handle_subscribe_camera(data):
 
 @socketio.on('unsubscribe_camera')
 def handle_unsubscribe_camera(data):
+    if not isinstance(data, dict):
+        emit('stream_error', {'message': 'Invalid payload'})
+        return
+
     camera_id = data.get('camera_id')
     if camera_id:
         socketio.leave_room(f'camera_{camera_id}')
@@ -1483,6 +748,10 @@ def handle_unsubscribe_camera(data):
 
 @socketio.on('subscribe_person')
 def handle_subscribe_person(data):
+    if not isinstance(data, dict):
+        emit('stream_error', {'message': 'Invalid payload'})
+        return
+
     person_id = data.get('person_id')
     if person_id:
         socketio.join_room(f'person_{person_id}')
@@ -1496,6 +765,10 @@ def handle_stream_camera(data):
     Client sends: {camera_id: 'camera1'}
     Server emits: 'camera_frame' events with base64 frame data
     """
+    if not isinstance(data, dict):
+        emit('stream_error', {'message': 'Invalid payload'})
+        return
+
     camera_id = data.get('camera_id')
     if not camera_id:
         emit('stream_error', {'message': 'camera_id is required'})
@@ -1506,7 +779,6 @@ def handle_stream_camera(data):
         with streaming_lock:
             if camera_id not in streaming_subscriptions:
                 streaming_subscriptions[camera_id] = {}
-            streaming_subscriptions[request.sid] = True
             streaming_subscriptions[camera_id][request.sid] = True
         
         emit('stream_started', {
@@ -1523,6 +795,10 @@ def handle_stop_stream_camera(data):
     """
     Stop streaming camera frames from this client.
     """
+    if not isinstance(data, dict):
+        emit('stream_error', {'message': 'Invalid payload'})
+        return
+
     camera_id = data.get('camera_id')
     
     with streaming_lock:
@@ -1557,16 +833,37 @@ def handle_get_streaming_cameras():
 @app.errorhandler(Unauthorized)
 @app.errorhandler(InternalServerError)
 def handle_error(e):
-    logger.error(f"Error: {str(e)}")
-    return jsonify({'message': str(e)}), getattr(e, 'code', 500)
+    try:
+        from deployment.services.dto_service import error_response
+    except ImportError:
+        from services.dto_service import error_response
+
+    code = getattr(e, 'code', 500)
+    if code >= 500:
+        logger.exception("Unhandled server error")
+        return error_response("INTERNAL_SERVER_ERROR", "Internal server error", code)
+
+    logger.warning(f"Request error ({code}): {e}")
+    message = getattr(e, 'description', 'Request error')
+    return error_response("REQUEST_ERROR", message, code)
 
 @app.errorhandler(404)
 def not_found(e):
-    return jsonify({'message': 'Endpoint not found'}), 404
+    del e
+    try:
+        from deployment.services.dto_service import error_response
+    except ImportError:
+        from services.dto_service import error_response
+    return error_response("NOT_FOUND", "Endpoint not found", 404)
 
 @app.errorhandler(500)
 def internal_error(e):
-    return jsonify({'message': 'Internal server error'}), 500
+    del e
+    try:
+        from deployment.services.dto_service import error_response
+    except ImportError:
+        from services.dto_service import error_response
+    return error_response("INTERNAL_SERVER_ERROR", "Internal server error", 500)
 
 # ============================================================
 # HEALTH CHECK
@@ -1580,15 +877,24 @@ def health_check():
         with get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute('SELECT 1')
-    except Exception as e:
-        db_status = f'error: {str(e)}'
-    
-    return jsonify({
+    except Exception:
+        logger.exception("Database health check failed")
+        db_status = 'error'
+
+    payload = {
         'status': 'healthy' if db_status == 'ok' else 'degraded',
         'database': db_status,
         'cameras': len(camera_manager.cameras) if camera_manager else 0,
         'clients': len(connected_clients),
-        'timestamp': datetime.utcnow().isoformat()
+        'timestamp': datetime.utcnow().isoformat(),
+    }
+
+    # Backward compatibility: keep top-level health fields while also exposing standardized envelope.
+    return jsonify({
+        'success': True,
+        'message': 'Health check completed',
+        'data': payload,
+        **payload,
     }), 200
 
 # ============================================================
@@ -1605,3 +911,4 @@ if __name__ == '__main__':
         camera_manager.start_camera('webcam1')
     
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
+

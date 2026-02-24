@@ -10,6 +10,8 @@ import numpy as np
 import logging
 from typing import List, Tuple, Optional
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -28,9 +30,9 @@ class DataAugmentor:
     def __init__(
         self,
         rotation_angles: List[int] = None,
-        brightness_range: Tuple[float, float] = (0.7, 1.3),
-        contrast_range: Tuple[float, float] = (0.8, 1.2),
-        flip_probability: float = 0.5
+        brightness_range: Tuple[float, float] = None,
+        contrast_range: Tuple[float, float] = None,
+        flip_probability: float = None
     ):
         """
         Initialize the augmentor.
@@ -41,10 +43,10 @@ class DataAugmentor:
             contrast_range: (min, max) contrast multiplier
             flip_probability: Probability of horizontal flip
         """
-        self.rotation_angles = rotation_angles or [-30, -15, 15, 30]
-        self.brightness_range = brightness_range
-        self.contrast_range = contrast_range
-        self.flip_probability = flip_probability
+        self.rotation_angles = rotation_angles if rotation_angles is not None else config.AUGMENTATION_ROTATION_ANGLES
+        self.brightness_range = brightness_range if brightness_range is not None else config.AUGMENTATION_BRIGHTNESS_RANGE
+        self.contrast_range = contrast_range if contrast_range is not None else config.AUGMENTATION_CONTRAST_RANGE
+        self.flip_probability = flip_probability if flip_probability is not None else config.AUGMENTATION_FLIP_PROBABILITY
     
     def rotate_image(
         self, 
@@ -298,7 +300,7 @@ class DataAugmentor:
 
 def augment_face_batch(
     images: List[np.ndarray],
-    target_count: int = 10,
+    target_count: int = None,
     augmentor: DataAugmentor = None
 ) -> List[np.ndarray]:
     """
@@ -312,6 +314,9 @@ def augment_face_batch(
     Returns:
         List of augmented images (at least target_count)
     """
+    if target_count is None:
+        target_count = config.AUGMENTATION_TARGET_COUNT
+    
     if augmentor is None:
         augmentor = DataAugmentor()
     

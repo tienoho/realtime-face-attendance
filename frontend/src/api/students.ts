@@ -1,4 +1,5 @@
 import api from './axios'
+import { ApiEnvelope, unwrapEnvelope, unwrapEnvelopeWithMessage } from './dto'
 
 export interface Student {
   student_id: string
@@ -74,8 +75,8 @@ export interface CaptureFaceResponse {
 
 export const studentsApi = {
   getStudents: async (): Promise<{ students: Student[] }> => {
-    const response = await api.get<{ students: Student[] }>('/students')
-    return response.data
+    const response = await api.get<ApiEnvelope<{ students: Student[] }>>('/students')
+    return unwrapEnvelope(response.data)
   },
 
   registerStudent: async (data: RegisterStudentRequest): Promise<RegisterStudentResponse> => {
@@ -85,7 +86,7 @@ export const studentsApi = {
     if (data.subject) formData.append('subject', data.subject)
     formData.append('file', data.file)
 
-    const response = await api.post<RegisterStudentResponse>(
+    const response = await api.post<ApiEnvelope<Omit<RegisterStudentResponse, 'message'>>>(
       '/register-student',
       formData,
       {
@@ -94,7 +95,7 @@ export const studentsApi = {
         },
       }
     )
-    return response.data
+    return unwrapEnvelopeWithMessage(response.data)
   },
 
   // Phase 2: Multi-image registration
@@ -105,11 +106,11 @@ export const studentsApi = {
     formData.append('apply_augmentation', data.apply_augmentation !== false ? 'true' : 'false')
     
     // Append multiple images
-    data.images.forEach((file, index) => {
+    data.images.forEach((file) => {
       formData.append('images', file)
     })
 
-    const response = await api.post<RegisterStudentMultiResponse>(
+    const response = await api.post<ApiEnvelope<Omit<RegisterStudentMultiResponse, 'message'>>>(
       '/register-student-multi',
       formData,
       {
@@ -118,15 +119,15 @@ export const studentsApi = {
         },
       }
     )
-    return response.data
+    return unwrapEnvelopeWithMessage(response.data)
   },
 
   // Capture face from webcam
   captureFace: async (data: CaptureFaceRequest): Promise<CaptureFaceResponse> => {
-    const response = await api.post<CaptureFaceResponse>(
+    const response = await api.post<ApiEnvelope<Omit<CaptureFaceResponse, 'message'>>>(
       '/register-face-capture',
       data
     )
-    return response.data
+    return unwrapEnvelopeWithMessage(response.data)
   },
 }

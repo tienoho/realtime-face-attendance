@@ -12,6 +12,8 @@ import numpy as np
 from typing import List, Tuple, Optional, Dict, Any
 from dataclasses import dataclass
 
+from . import config
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,19 +44,16 @@ class FaceDetector:
     - Real-time performance on CPU
     """
     
-    # Use buffalo_s for faster performance on CPU
-    # Use buffalo_l for higher accuracy (slower)
-    DEFAULT_MODEL = 'buffalo_s'
-    
-    # Smaller detection size for better FPS
-    DEFAULT_DET_SIZE = (320, 320)
+    # Use config values
+    DEFAULT_MODEL = config.DETECTOR_MODEL
+    DEFAULT_DET_SIZE = config.DETECTOR_SIZE
     
     def __init__(
         self,
         model_name: str = None,
         providers: List[str] = None,
         det_size: Tuple[int, int] = None,
-        det_threshold: float = 0.5
+        det_threshold: float = None
     ):
         """
         Initialize the face detector.
@@ -68,7 +67,7 @@ class FaceDetector:
         self.model_name = model_name or self.DEFAULT_MODEL
         self.providers = providers or ['CPUExecutionProvider']
         self.det_size = det_size or self.DEFAULT_DET_SIZE
-        self.det_threshold = det_threshold
+        self.det_threshold = det_threshold if det_threshold is not None else config.DETECTOR_THRESHOLD
         
         self._app = None
         self._initialize()

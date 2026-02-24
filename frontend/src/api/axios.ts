@@ -27,6 +27,14 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response,
   (error) => {
+    const apiMessage =
+      error?.response?.data?.error?.message ||
+      error?.response?.data?.message
+
+    if (apiMessage) {
+      error.message = apiMessage
+    }
+
     if (error.response?.status === 401) {
       localStorage.removeItem('fa_token')
       window.location.href = '/login'
