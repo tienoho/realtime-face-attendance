@@ -64,8 +64,8 @@ except ImportError:
 # DATABASE TYPE SELECTION
 # ============================================================
 
-# Set DB_TYPE to 'mysql' or 'postgresql' (default: mysql for backward compatibility)
-DB_TYPE = os.getenv('DB_TYPE', 'mysql').lower()
+# Set DB_TYPE to 'postgresql' (default: postgresql for new deployments)
+DB_TYPE = os.getenv('DB_TYPE', 'postgresql').lower()
 
 # Import appropriate database module
 if DB_TYPE == 'postgresql':
@@ -142,7 +142,7 @@ app.config['LABEL_MAP_PATH'] = os.getenv('LABEL_MAP_PATH', 'model/label_map.json
 DB_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': int(os.getenv('DB_PORT', 5432)),  # PostgreSQL default
-    'user': os.getenv('DB_USER', 'postgres'),  # PostgreSQL default
+    'user': os.getenv('DB_USER', 'faceuser'),  # PostgreSQL default user
     'password': os.getenv('DB_PASSWORD', ''),
     'database': os.getenv('DB_NAME', 'face_attendance'),
     'charset': 'utf8mb4',

@@ -5,12 +5,28 @@ import re
 import threading
 from pathlib import Path
 
+import cv2
 import psycopg2
 import pymysql
 
 # C-ED-001 FIX: File size limits for DoS prevention (in bytes)
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB per file
 MAX_TOTAL_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB total per request
+
+# H-PERF-001 FIX: Image resizing configuration
+MAX_IMAGE_DIMENSION = 1920  # Max width/height for processed images
+TARGET_FACE_SIZE = 640  # Target size for face crops
+
+
+def resize_image_if_needed(img, max_dim=MAX_IMAGE_DIMENSION):
+    """Resize image if dimensions exceed maximum."""
+    height, width = img.shape[:2]
+    if width > max_dim or height > max_dim:
+        scale = max_dim / max(width, height)
+        new_width = int(width * scale)
+        new_height = int(height * scale)
+        return cv2.resize(img, (new_width, new_height), interpolation=cv2.INTER_AREA)
+    return img
 
 
 def validate_file_size(file_size: int, max_size: int = MAX_FILE_SIZE) -> tuple[bool, str]:
@@ -80,6 +96,9 @@ def register_student(rt, current_user):
     del current_user  # reserved for audit/authorization extensions
 
     conn = None
+    cursor = None
+    saved_files = []  # Track saved files for cleanup on failure
+    
     try:
         if "file" not in rt.request.files:
             return error_response("MISSING_FILE", "No file provided", 400)
@@ -117,48 +136,66 @@ def register_student(rt, current_user):
         if not face_boxes:
             return error_response("NO_FACE_DETECTED", "No face detected in image", 400)
 
+        # H-DB-002 FIX: Transaction support with rollback
         with rt.get_db_connection() as conn:
             cursor = conn.cursor()
-
-            cursor.execute("SELECT id FROM students WHERE student_id = %s", (student_id,))
-            if cursor.fetchone():
-                return error_response("DUPLICATE_STUDENT_ID", f"Student ID {student_id} already exists", 409)
-
-            cursor.execute(
-                "INSERT INTO students (student_id, name) VALUES (%s, %s)",
-                (student_id, name),
-            )
-
-            # C-SEC-002 FIX: Use safe path validation
-            is_valid, student_folder, error = get_safe_student_folder(rt, student_id)
-            if not is_valid:
-                return error_response("INVALID_STUDENT_ID", error, 400)
             
-            os.makedirs(student_folder, exist_ok=True)
-
-            saved_count = 0
-            for x, y, w, h in face_boxes[:1]:
-                pad = 20
-                x1 = max(0, x - pad)
-                y1 = max(0, y - pad)
-                x2 = min(img.shape[1], x + w + pad)
-                y2 = min(img.shape[0], y + h + pad)
-
-                face_img = img[y1:y2, x1:x2]
-                gray_face = rt.cv2.cvtColor(face_img, rt.cv2.COLOR_BGR2GRAY)
-
-                # C-ED-002 FIX: Use UTC timezone
-                img_filename = f"{student_id}_{rt.datetime.now(rt.timezone.utc).strftime('%Y%m%d%H%M%S')}.jpg"
-                img_path = os.path.join(student_folder, img_filename)
-                rt.cv2.imwrite(img_path, gray_face)
+            # Disable autocommit for transaction control
+            conn.autocommit = False
+            
+            try:
+                cursor.execute("SELECT id FROM students WHERE student_id = %s", (student_id,))
+                if cursor.fetchone():
+                    conn.rollback()
+                    return error_response("DUPLICATE_STUDENT_ID", f"Student ID {student_id} already exists", 409)
 
                 cursor.execute(
-                    "INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)",
-                    (student_id, img_path),
+                    "INSERT INTO students (student_id, name) VALUES (%s, %s)",
+                    (student_id, name),
                 )
-                saved_count += 1
 
-            rt.logger.info(f"Student {student_id} ({name}) registered with {saved_count} images")
+                # C-SEC-002 FIX: Use safe path validation
+                is_valid, student_folder, error = get_safe_student_folder(rt, student_id)
+                if not is_valid:
+                    conn.rollback()
+                    return error_response("INVALID_STUDENT_ID", error, 400)
+                
+                os.makedirs(student_folder, exist_ok=True)
+
+                saved_count = 0
+                for x, y, w, h in face_boxes[:1]:
+                    pad = 20
+                    x1 = max(0, x - pad)
+                    y1 = max(0, y - pad)
+                    x2 = min(img.shape[1], x + w + pad)
+                    y2 = min(img.shape[0], y + h + pad)
+
+                    face_img = img[y1:y2, x1:x2]
+                    gray_face = rt.cv2.cvtColor(face_img, rt.cv2.COLOR_BGR2GRAY)
+
+                    # C-ED-002 FIX: Use UTC timezone
+                    img_filename = f"{student_id}_{rt.datetime.now(rt.timezone.utc).strftime('%Y%m%d%H%M%S')}.jpg"
+                    img_path = os.path.join(student_folder, img_filename)
+                    rt.cv2.imwrite(img_path, gray_face)
+                    saved_files.append(img_path)  # Track for cleanup
+
+                    cursor.execute(
+                        "INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)",
+                        (student_id, img_path),
+                    )
+                    saved_count += 1
+
+                # Commit transaction
+                conn.commit()
+                rt.logger.info(f"Student {student_id} ({name}) registered with {saved_count} images")
+                
+            except Exception as e:
+                # H-DB-002 FIX: Rollback on error
+                conn.rollback()
+                rt.logger.error(f"Transaction rolled back for student {student_id}: {e}")
+                raise
+            finally:
+                conn.autocommit = True
 
         rt.logger.info("Starting auto-training after student registration...")
         training_result = rt.train_face_recognition_model()
@@ -224,6 +261,7 @@ def register_student_multi(rt, current_user):
         if not valid:
             return error_response("VALIDATION_ERROR", error, 400)
 
+        # H-DB-002 FIX: Check for duplicates before processing images
         with rt.get_db_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT id FROM students WHERE student_id = %s", (student_id,))
@@ -313,19 +351,41 @@ def register_student_multi(rt, current_user):
             except Exception as save_err:
                 rt.logger.warning(f"Failed to save image {i}: {save_err}")
 
+        # H-DB-002 FIX: Transaction support with rollback
         with rt.get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO students (student_id, name) VALUES (%s, %s)",
-                (student_id, name),
-            )
-
-            for i in range(saved_count):
-                img_path = os.path.join(student_folder, f"{student_id}_{i:03d}.jpg")
+            conn.autocommit = False
+            
+            try:
                 cursor.execute(
-                    "INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)",
-                    (student_id, img_path),
+                    "INSERT INTO students (student_id, name) VALUES (%s, %s)",
+                    (student_id, name),
                 )
+
+                for i in range(saved_count):
+                    img_path = os.path.join(student_folder, f"{student_id}_{i:03d}.jpg")
+                    cursor.execute(
+                        "INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)",
+                        (student_id, img_path),
+                    )
+                
+                conn.commit()
+                rt.logger.info(f"Student {student_id} registered with {saved_count} images (transaction)")
+                
+            except Exception as e:
+                conn.rollback()
+                rt.logger.error(f"Transaction rolled back for student {student_id}: {e}")
+                # Cleanup saved files on rollback
+                for i in range(saved_count):
+                    img_path = os.path.join(student_folder, f"{student_id}_{i:03d}.jpg")
+                    if os.path.exists(img_path):
+                        try:
+                            os.remove(img_path)
+                        except Exception as cleanup_err:
+                            rt.logger.warning(f"Failed to cleanup {img_path}: {cleanup_err}")
+                return error_response("DATABASE_ERROR", "Failed to save student data", 500)
+            finally:
+                conn.autocommit = True
 
         pipeline_result = {"status": "not_available"}
         pipeline = rt.get_face_pipeline()
@@ -434,15 +494,26 @@ def register_face_capture(rt, current_user):
         if face_crop is None or face_crop.size == 0:
             return error_response("NO_FACE_DETECTED", "No face detected in image", 400)
 
+        # H-DB-002 FIX: Transaction support with rollback
         with rt.get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM students WHERE student_id = %s", (student_id,))
-            exists = cursor.fetchone()
-            if not exists:
-                cursor.execute(
-                    "INSERT INTO students (student_id, name) VALUES (%s, %s)",
-                    (student_id, name),
-                )
+            conn.autocommit = False
+            
+            try:
+                cursor.execute("SELECT id FROM students WHERE student_id = %s", (student_id,))
+                exists = cursor.fetchone()
+                if not exists:
+                    cursor.execute(
+                        "INSERT INTO students (student_id, name) VALUES (%s, %s)",
+                        (student_id, name),
+                    )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                rt.logger.error(f"Transaction rolled back for student {student_id}: {e}")
+                return error_response("DATABASE_ERROR", "Failed to save student", 500)
+            finally:
+                conn.autocommit = True
 
         # C-SEC-002 FIX: Use safe path validation
         is_valid, student_folder, error = get_safe_student_folder(rt, student_id)
@@ -457,12 +528,29 @@ def register_face_capture(rt, current_user):
         img_path = os.path.join(student_folder, img_filename)
         rt.cv2.imwrite(img_path, face_crop)
 
+        # H-DB-002 FIX: Transaction for training image
         with rt.get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)",
-                (student_id, img_path),
-            )
+            conn.autocommit = False
+            
+            try:
+                cursor.execute(
+                    "INSERT INTO training_images (student_id, image_path) VALUES (%s, %s)",
+                    (student_id, img_path),
+                )
+                conn.commit()
+            except Exception as e:
+                conn.rollback()
+                rt.logger.error(f"Transaction rolled back for training image: {e}")
+                # Cleanup saved file
+                if os.path.exists(img_path):
+                    try:
+                        os.remove(img_path)
+                    except Exception as cleanup_err:
+                        rt.logger.warning(f"Failed to cleanup {img_path}: {cleanup_err}")
+                return error_response("DATABASE_ERROR", "Failed to save training image", 500)
+            finally:
+                conn.autocommit = True
 
         pipeline = rt.get_face_pipeline()
         faiss_result = {"status": "not_available"}

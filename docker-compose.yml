@@ -1,25 +1,24 @@
 version: '3.8'
 
 services:
-  # MySQL Database
+  # PostgreSQL Database
   db:
-    image: mysql:8.0
+    image: postgres:15-alpine
     container_name: face-attendance-db
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: rootpassword
-      MYSQL_DATABASE: face_attendance
-      MYSQL_USER: faceuser
-      MYSQL_PASSWORD: facepassword
+      POSTGRES_USER: faceuser
+      POSTGRES_PASSWORD: facepassword
+      POSTGRES_DB: face_attendance
     volumes:
-      - mysql_data:/var/lib/mysql
-      - ./database/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/postgres_schema.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
-      - "3306:3306"
+      - "5432:5432"
     networks:
       - face-attendance-network
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      test: ["CMD-SHELL", "pg_isready -U faceuser -d face_attendance"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -36,22 +35,34 @@ services:
       - DB_USER=faceuser
       - DB_PASSWORD=facepassword
       - DB_NAME=face_attendance
+      - DB_TYPE=postgresql
+      - DB_PORT=5432
       - SECRET_KEY=your-secret-key-change-in-production
       - PORT=5001
       - UPLOAD_FOLDER=/app/TrainingImage
       - MODEL_PATH=/app/model/Trainer.yml
       - CASCADE_PATH=/app/model/Haarcascade.xml
+      - LABEL_MAP_PATH=/app/model/label_map.json
+      - CORS_ORIGINS=http://localhost,http://localhost:80,http://localhost:3000,http://localhost:5173
+      - REDIS_URL=memory://
     ports:
       - "5001:5001"
     volumes:
       - ./TrainingImage:/app/TrainingImage
       - ./model:/app/model
       - ./logs:/app/logs
+      - ./face_recognition:/app/face_recognition
     depends_on:
       db:
         condition: service_healthy
     networks:
       - face-attendance-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:5001/api/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
   # Frontend (React + Nginx)
   frontend:
@@ -68,7 +79,7 @@ services:
       - face-attendance-network
 
 volumes:
-  mysql_data:
+  postgres_data:
 
 networks:
   face-attendance-network:

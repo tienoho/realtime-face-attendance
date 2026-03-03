@@ -2,15 +2,15 @@
 Database connection pool manager for Face Attendance API
 ======================================================
 
-Supports both MySQL and PostgreSQL databases.
-Set DB_TYPE environment variable to 'mysql' or 'postgresql' (default: mysql).
+Supports both PostgreSQL and MySQL databases.
+Set DB_TYPE environment variable to 'postgresql' (default) or 'mysql'.
 
 Usage:
-    # For MySQL (default)
-    DB_TYPE=mysql python deployment/api.py
-    
-    # For PostgreSQL
+    # For PostgreSQL (default)
     DB_TYPE=postgresql python deployment/api.py
+    
+    # For MySQL (deprecated)
+    DB_TYPE=mysql python deployment/api.py
 """
 
 import os
@@ -23,8 +23,8 @@ from psycopg2 import pool
 
 logger = logging.getLogger(__name__)
 
-# Database type selection
-DB_TYPE = os.getenv('DB_TYPE', 'mysql').lower()
+# Database type selection (default: postgresql)
+DB_TYPE = os.getenv('DB_TYPE', 'postgresql').lower()
 
 # ============================================================
 # MYSQL CONFIGURATION
@@ -59,7 +59,7 @@ MYSQL_POOL_CONFIG = {
 POSTGRESQL_CONFIG = {
     'host': os.getenv('DB_HOST', 'localhost'),
     'port': int(os.getenv('DB_PORT', 5432)),
-    'user': os.getenv('DB_USER', 'postgres'),
+    'user': os.getenv('DB_USER', 'faceuser'),
     'password': os.getenv('DB_PASSWORD', ''),
     'database': os.getenv('DB_NAME', 'face_attendance'),
     'sslmode': os.getenv('DB_SSLMODE', 'prefer'),
