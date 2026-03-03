@@ -5,6 +5,8 @@ Handles face detection and recognition for multiple camera streams
 NOTE: This module now supports two modes:
 1. Legacy mode: Haar Cascade + MediaPipe + LBPH (original)
 2. InsightFace mode: RetinaFace + ArcFace + FAISS (recommended)
+
+C-ML-001 FIX: Bounded thread pool to prevent memory overflow
 """
 import cv2
 import numpy as np
@@ -14,8 +16,65 @@ import time
 import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, Future
+from queue import Queue
 
 logger = logging.getLogger(__name__)
+
+
+# C-ML-001 FIX: Bounded ThreadPoolExecutor to prevent unbounded queue growth
+class BoundedThreadPoolExecutor(ThreadPoolExecutor):
+    """
+    ThreadPoolExecutor with bounded queue to prevent memory overflow.
+    
+    When queue is full, new tasks are rejected instead of growing indefinitely.
+    """
+    
+    def __init__(self, max_workers=None, max_queue_size=100, thread_name_prefix=''):
+        super().__init__(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
+        self._max_queue_size = max_queue_size
+        self._work_queue = Queue(maxsize=max_queue_size)
+        self._dropped_tasks = 0
+        self._dropped_lock = threading.Lock()
+    
+    def submit(self, fn, *args, **kwargs):
+        """
+        Submit a task to the executor.
+        
+        Returns:
+            Future if task submitted, None if queue is full (backpressure)
+        """
+        with self._shutdown_lock:
+            if self._shutdown:
+                raise RuntimeError('cannot schedule new futures after shutdown')
+            
+            # Try to put work item in queue without blocking
+            try:
+                work_item = self._WorkItem(None, fn, args, kwargs, None)
+                self._work_queue.put_nowait(work_item)
+            except:
+                # Queue is full - apply backpressure
+                with self._dropped_lock:
+                    self._dropped_tasks += 1
+                    dropped = self._dropped_tasks
+                
+                if dropped % 100 == 0:
+                    logger.warning(
+                        f"FrameProcessor backpressure: dropped {dropped} tasks "
+                        f"(queue full: {self._max_queue_size})"
+                    )
+                return None  # Signal caller to skip this frame
+            
+            # Create future and set callback
+            f = Future()
+            f._work_item = work_item
+            work_item.future = f
+            
+            return f
+    
+    def get_dropped_count(self):
+        """Get number of dropped tasks due to backpressure."""
+        with self._dropped_lock:
+            return self._dropped_tasks
 
 # Try to import InsightFace pipeline
 try:
@@ -61,7 +120,12 @@ class FrameProcessor:
             frame_skip: Process every Nth frame (for performance)
         """
         self.num_workers = num_workers
-        self.executor = ThreadPoolExecutor(max_workers=num_workers)
+        # C-ML-001 FIX: Use BoundedThreadPoolExecutor with limited queue
+        self.executor = BoundedThreadPoolExecutor(
+            max_workers=num_workers,
+            max_queue_size=100,  # Limit pending tasks to prevent memory overflow
+            thread_name_prefix='frame_processor'
+        )
         
         # Use InsightFace or legacy
         self.use_insightface = use_insightface and INSIGHTFACE_AVAILABLE
@@ -471,16 +535,22 @@ class FrameProcessor:
     
     def process_frame_async(self, camera_id, frame):
         """
-        Process frame asynchronously
+        Process frame asynchronously with backpressure.
+        
+        C-ML-001 FIX: Returns None if queue is full (backpressure).
         
         Args:
             camera_id: Camera identifier
             frame: Input frame
         
         Returns:
-            Future: Async result
+            Future: Async result, or None if queue is full (frame dropped)
         """
-        return self.executor.submit(self.process_frame, camera_id, frame)
+        future = self.executor.submit(self.process_frame, camera_id, frame)
+        if future is None:
+            # Queue is full - frame will be dropped
+            logger.debug(f"Frame dropped for {camera_id} due to backpressure")
+        return future
     
     def get_latest_result(self, camera_id):
         """Get the latest processing result for a camera"""

@@ -1,12 +1,108 @@
 """Authentication service layer."""
 
+import uuid
 import psycopg2
 import pymysql
+from datetime import datetime, timedelta
 
 try:
     from deployment.services.dto_service import error_response, success_response
 except ImportError:
     from services.dto_service import error_response, success_response
+
+
+# H-AUTH-001: JWT Refresh Token configuration
+ACCESS_TOKEN_EXPIRY_HOURS = 1  # Short-lived access token
+REFRESH_TOKEN_EXPIRY_DAYS = 7  # Long-lived refresh token
+
+# In-memory refresh token store (production: use Redis/database)
+_refresh_tokens = {}  # token_id: {user_id, expires_at}
+
+
+def _generate_tokens(rt, user_id: int, username: str) -> dict:
+    """Generate access token and refresh token pair."""
+    # Access token (short-lived)
+    access_token = rt.jwt.encode(
+        {
+            "user_id": user_id,
+            "username": username,
+            "type": "access",
+            "exp": datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRY_HOURS),
+        },
+        rt.app.config["SECRET_KEY"],
+        algorithm="HS256",
+    )
+    
+    # Refresh token (long-lived, opaque)
+    refresh_token_id = str(uuid.uuid4())
+    refresh_token_expires = datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRY_DAYS)
+    
+    _refresh_tokens[refresh_token_id] = {
+        "user_id": user_id,
+        "username": username,
+        "expires_at": refresh_token_expires,
+    }
+    
+    return {
+        "access_token": access_token,
+        "refresh_token": refresh_token_id,
+        "token_type": "Bearer",
+        "expires_in": ACCESS_TOKEN_EXPIRY_HOURS * 3600,  # seconds
+    }
+
+
+def refresh_access_token(rt):
+    """Refresh access token using refresh token."""
+    try:
+        data = rt.request.get_json(silent=True)
+        if not data or not data.get("refresh_token"):
+            return error_response("MISSING_REFRESH_TOKEN", "Refresh token required", 400)
+        
+        refresh_token_id = data.get("refresh_token")
+        
+        # Validate refresh token
+        token_data = _refresh_tokens.get(refresh_token_id)
+        if not token_data:
+            return error_response("INVALID_REFRESH_TOKEN", "Invalid or expired refresh token", 401)
+        
+        if datetime.utcnow() > token_data["expires_at"]:
+            # Clean up expired token
+            del _refresh_tokens[refresh_token_id]
+            return error_response("EXPIRED_REFRESH_TOKEN", "Refresh token expired", 401)
+        
+        # Generate new token pair
+        tokens = _generate_tokens(rt, token_data["user_id"], token_data["username"])
+        
+        # Invalidate old refresh token (token rotation)
+        del _refresh_tokens[refresh_token_id]
+        
+        rt.logger.info(f"Token refreshed for user {token_data['username']}")
+        return success_response(
+            tokens,
+            message="Token refreshed successfully",
+            status=200,
+        )
+        
+    except Exception as e:
+        rt.logger.error(f"Token refresh error: {e}")
+        return error_response("SERVER_ERROR", "Server error", 500)
+
+
+def logout(rt):
+    """Logout user by invalidating refresh token."""
+    try:
+        data = rt.request.get_json(silent=True)
+        refresh_token_id = data.get("refresh_token") if data else None
+        
+        if refresh_token_id and refresh_token_id in _refresh_tokens:
+            del _refresh_tokens[refresh_token_id]
+            rt.logger.info("Refresh token invalidated")
+        
+        return success_response({}, message="Logout successful", status=200)
+        
+    except Exception as e:
+        rt.logger.error(f"Logout error: {e}")
+        return error_response("SERVER_ERROR", "Server error", 500)
 
 
 def _verify_password(rt, stored_hash, password):
@@ -65,20 +161,16 @@ def login(rt):
             if not _verify_password(rt, stored_hash, password):
                 return error_response("INVALID_CREDENTIALS", "Invalid credentials", 401)
 
-            token = rt.jwt.encode(
-                {
-                    "user_id": user[0],
-                    "username": user[1],
-                    "exp": rt.datetime.utcnow() + rt.timedelta(hours=24),
-                },
-                rt.app.config["SECRET_KEY"],
-                algorithm="HS256",
-            )
+            # H-AUTH-001: Generate access and refresh tokens
+            tokens = _generate_tokens(rt, user[0], user[1])
 
             rt.logger.info(f"User {username} logged in successfully")
             return success_response(
                 {
-                    "token": token,
+                    "token": tokens["access_token"],
+                    "refresh_token": tokens["refresh_token"],
+                    "token_type": tokens["token_type"],
+                    "expires_in": tokens["expires_in"],
                     "user_id": user[0],
                     "username": user[1],
                 },

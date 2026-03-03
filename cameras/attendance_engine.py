@@ -2,13 +2,56 @@
 Attendance Engine - Handle attendance recording and deduplication
 Manages attendance records, prevents duplicates, and integrates with database
 """
+import json
 import logging
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
+
+
+# C-SEC-003 FIX: Metadata validation constants
+ALLOWED_METADATA_KEYS = {'bbox', 'confidence', 'processing_time', 'face_quality', 'detection_score'}
+MAX_METADATA_SIZE = 1024  # 1KB limit
+
+def sanitize_metadata(metadata):
+    """
+    Sanitize metadata to prevent SQL injection and limit size.
+    
+    Args:
+        metadata: Input metadata dict or any type
+        
+    Returns:
+        dict: Sanitized metadata with only allowed keys
+    """
+    if not isinstance(metadata, dict):
+        return {}
+    
+    # Filter allowed keys and validate values
+    sanitized = {}
+    for key, value in metadata.items():
+        if key not in ALLOWED_METADATA_KEYS:
+            continue
+        
+        # Validate value type
+        if isinstance(value, (int, float, bool)):
+            sanitized[key] = value
+        elif isinstance(value, str):
+            # Limit string length
+            sanitized[key] = value[:256] if len(value) > 256 else value
+        elif isinstance(value, (list, tuple)) and len(value) <= 4:
+            # Allow small lists (e.g., bbox coordinates)
+            sanitized[key] = list(value)[:4]
+    
+    # Check total size
+    json_str = json.dumps(sanitized)
+    if len(json_str) > MAX_METADATA_SIZE:
+        logger.warning(f"Metadata too large ({len(json_str)} bytes), truncating")
+        return {}
+    
+    return sanitized
 
 
 class AttendanceEngine:
@@ -53,7 +96,11 @@ class AttendanceEngine:
     
     def record_attendance(self, person_id, camera_id, confidence=None, metadata=None):
         """
-        Record an attendance event
+        Record an attendance event with atomic deduplication.
+        
+        C-RC-001 FIX: Check and record trong cùng một atomic block
+        C-SEC-003 FIX: Sanitize metadata trước khi lưu
+        C-ED-002 FIX: Sử dụng UTC timezone
         
         Args:
             person_id: ID of the recognized person
@@ -66,32 +113,52 @@ class AttendanceEngine:
         """
         timestamp = time.time()
         
-        # Check for duplicate
-        if self._is_duplicate(person_id, camera_id, timestamp):
+        # C-RC-001 FIX: Atomic check-and-set operation
+        with self.cache_lock:
+            key = (person_id, camera_id)
+            
+            # Check for duplicate
+            if key in self.recent_attendance:
+                last_time = self.recent_attendance[key]
+                if timestamp - last_time < self.dedup_window:
+                    # Duplicate detected
+                    with self.stats_lock:
+                        self.stats['duplicates'] += 1
+                    
+                    for callback in self.on_duplicate_detected:
+                        try:
+                            callback(person_id, camera_id, timestamp)
+                        except Exception as e:
+                            logger.error(f"Duplicate callback error: {e}")
+                    
+                    return False
+            
+            # Record in cache immediately (atomic)
+            self.recent_attendance[key] = timestamp
+            
+            # Update stats trong cùng lock
             with self.stats_lock:
-                self.stats['duplicates'] += 1
-            
-            for callback in self.on_duplicate_detected:
-                try:
-                    callback(person_id, camera_id, timestamp)
-                except Exception as e:
-                    logger.error(f"Duplicate callback error: {e}")
-            
-            return False
+                self.stats['total_records'] += 1
+        
+        # C-SEC-003 FIX: Sanitize metadata
+        safe_metadata = sanitize_metadata(metadata)
+        
+        # C-ED-002 FIX: Use UTC timezone
+        now_utc = datetime.now(timezone.utc)
         
         # Record attendance
         attendance_record = {
             'person_id': person_id,
             'camera_id': camera_id,
             'timestamp': timestamp,
-            'datetime': datetime.now().isoformat(),
-            'date': datetime.now().strftime('%Y-%m-%d'),
-            'time': datetime.now().strftime('%H:%M:%S'),
+            'datetime': now_utc.isoformat(),
+            'date': now_utc.strftime('%Y-%m-%d'),
+            'time': now_utc.strftime('%H:%M:%S'),
             'confidence': confidence,
-            'metadata': metadata or {}
+            'metadata': safe_metadata
         }
         
-        # Save to database
+        # Save to database (async or sync)
         if self.db_pool:
             try:
                 self._save_to_db(attendance_record)
@@ -99,13 +166,6 @@ class AttendanceEngine:
                 logger.error(f"Database error: {e}")
                 with self.stats_lock:
                     self.stats['db_errors'] += 1
-        
-        # Update in-memory cache
-        self._record_attendance(person_id, camera_id, timestamp)
-        
-        # Update statistics
-        with self.stats_lock:
-            self.stats['total_records'] += 1
         
         # Notify callbacks
         for callback in self.on_attendance_recorded:
@@ -136,29 +196,37 @@ class AttendanceEngine:
             self.recent_attendance[key] = timestamp
     
     def _save_to_db(self, record):
-        """Save attendance to database"""
+        """
+        Save attendance to database với proper error handling.
+        
+        C-SEC-003 FIX: Use context manager for connection
+        """
         if not self.db_pool:
             return
         
-        conn = self.db_pool.connection()
-        cursor = conn.cursor()
-        
-        cursor.execute(
-            """INSERT INTO attendance 
-               (person_id, camera_id, date, time, confidence, metadata)
-               VALUES (%s, %s, %s, %s, %s, %s)""",
-            (
-                record['person_id'],
-                record['camera_id'],
-                record['date'],
-                record['time'],
-                record['confidence'],
-                str(record['metadata'])
-            )
-        )
-        
-        conn.commit()
-        conn.close()
+        try:
+            with self.db_pool.connection() as conn:
+                with conn.cursor() as cursor:
+                    # C-SEC-003 FIX: Use JSON dumps for safe serialization
+                    metadata_json = json.dumps(record['metadata'])
+                    
+                    cursor.execute(
+                        """INSERT INTO attendance
+                           (person_id, camera_id, date, time, confidence, metadata)
+                           VALUES (%s, %s, %s, %s, %s, %s)""",
+                        (
+                            record['person_id'],
+                            record['camera_id'],
+                            record['date'],
+                            record['time'],
+                            record['confidence'],
+                            metadata_json
+                        )
+                    )
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Database save error: {e}")
+            raise
     
     def _cleanup_loop(self):
         """Clean up old cache entries"""

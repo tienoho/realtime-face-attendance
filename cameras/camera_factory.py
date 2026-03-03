@@ -210,33 +210,65 @@ class RTSPCamera(BaseCamera):
 class HTTPCamera(BaseCamera):
     """HTTP/MJPEG stream camera connector"""
     
+    # H-CAM-002: Connection retry configuration
+    MAX_RETRIES = 3
+    INITIAL_RETRY_DELAY = 1.0  # seconds
+    MAX_RETRY_DELAY = 30.0  # seconds
+    
     def __init__(self, camera_id, config):
         super().__init__(camera_id, config)
         self.url = config.get('url', '')
         self.stream = None
         self.bytes = b''
         self.frame_cache = None
+        self._consecutive_errors = 0
+        self._last_retry_time = 0
+        self._current_retry_delay = self.INITIAL_RETRY_DELAY
         
     def connect(self):
-        """Connect to HTTP stream"""
-        try:
-            self.stream = urllib.request.urlopen(self.url, timeout=10)
-            self.is_connected = True
-            logger.info(f"HTTP Camera {self.camera_id} connected: {self.url}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Error connecting to HTTP camera {self.camera_id}: {e}")
-            return False
+        """Connect to HTTP stream with retry logic"""
+        # H-CAM-002: Implement exponential backoff retry
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                # H-CAM-001 FIX: Ensure previous connection is closed
+                self._close_stream()
+                
+                self.stream = urllib.request.urlopen(self.url, timeout=10)
+                self.is_connected = True
+                self._consecutive_errors = 0
+                self._current_retry_delay = self.INITIAL_RETRY_DELAY
+                logger.info(f"HTTP Camera {self.camera_id} connected: {self.url}")
+                return True
+                
+            except Exception as e:
+                self._consecutive_errors += 1
+                wait_time = min(self._current_retry_delay * (2 ** attempt), self.MAX_RETRY_DELAY)
+                logger.warning(
+                    f"HTTP Camera {self.camera_id} connection attempt {attempt + 1}/{self.MAX_RETRIES} "
+                    f"failed: {e}. Retrying in {wait_time:.1f}s..."
+                )
+                if attempt < self.MAX_RETRIES - 1:
+                    time.sleep(wait_time)
+        
+        logger.error(f"Failed to connect HTTP camera {self.camera_id} after {self.MAX_RETRIES} attempts")
+        return False
     
     def disconnect(self):
         """Disconnect from HTTP stream"""
-        if self.stream:
-            self.stream.close()
-            self.stream = None
+        self._close_stream()
         self.is_connected = False
         self.bytes = b''
         logger.info(f"HTTP Camera {self.camera_id} disconnected")
+    
+    def _close_stream(self):
+        """H-CAM-001 FIX: Safely close stream to prevent connection leak"""
+        if self.stream:
+            try:
+                self.stream.close()
+            except Exception as e:
+                logger.debug(f"Error closing stream for {self.camera_id}: {e}")
+            finally:
+                self.stream = None
     
     def read(self):
         """Read frame from HTTP stream (MJPEG)"""

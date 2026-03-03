@@ -70,7 +70,8 @@ def mark_attendance(rt, current_user):
                 payload = {"status": "not_found"}
                 return success_response(payload, message="Student not found or inactive", status=200)
 
-            today = rt.datetime.now().strftime("%Y-%m-%d")
+            # C-ED-002 FIX: Use UTC timezone
+            today = rt.datetime.now(rt.timezone.utc).strftime("%Y-%m-%d")
             cursor.execute(
                 "SELECT id FROM attendance WHERE student_id = %s AND date = %s AND subject = %s",
                 (student_id, today, subject),
@@ -83,7 +84,7 @@ def mark_attendance(rt, current_user):
                 }
                 return success_response(payload, message="Already marked attendance today", status=200)
 
-            now = rt.datetime.now()
+            now = rt.datetime.now(rt.timezone.utc)
             cursor.execute(
                 """INSERT INTO attendance
                    (student_id, enrollment, name, date, time, subject, status, confidence_score)
@@ -124,7 +125,8 @@ def get_attendance_report(rt, current_user):
     del current_user
 
     try:
-        date = rt.request.args.get("date", rt.datetime.now().strftime("%Y-%m-%d"))
+        # C-ED-002 FIX: Use UTC timezone
+        date = rt.request.args.get("date", rt.datetime.now(rt.timezone.utc).strftime("%Y-%m-%d"))
         subject = rt.request.args.get("subject", None)
 
         with rt.get_db_connection() as conn:

@@ -199,11 +199,32 @@ class CameraManager:
         Continuous capture loop for one camera
         
         This runs in a separate thread for each camera
+        C-RC-003 FIX: Thread-safe access to shared data structures
         """
-        camera = self.cameras[camera_id]
-        frame_queue = self.frame_queues[camera_id]
+        # C-RC-003 FIX: Get references under lock, then use local references
+        with self.lock:
+            camera = self.cameras.get(camera_id)
+            frame_queue = self.frame_queues.get(camera_id)
         
-        while self.running and camera_id in self.cameras and not stop_event.is_set():
+        if camera is None or frame_queue is None:
+            logger.error(f"Camera {camera_id} not found in capture loop")
+            return
+        
+        # Local stats buffer to minimize lock contention
+        local_stats = {
+            'frames_captured': 0,
+            'frames_dropped': 0,
+            'errors': 0,
+        }
+        
+        last_stats_update = time.time()
+        
+        while self.running and not stop_event.is_set():
+            # C-RC-003 FIX: Check camera existence under lock periodically
+            with self.lock:
+                if camera_id not in self.cameras:
+                    break
+            
             start_time = time.time()
             
             # Read frame
@@ -214,13 +235,23 @@ class CameraManager:
                 try:
                     # Try non-blocking put
                     frame_queue.put_nowait((frame, time.time()))
-                    self.stats[camera_id]['frames_captured'] += 1
-                    self.stats[camera_id]['last_frame_time'] = time.time()
+                    local_stats['frames_captured'] += 1
                     
                     # Calculate FPS
                     elapsed = time.time() - start_time
-                    if elapsed > 0:
-                        self.stats[camera_id]['fps'] = 1.0 / elapsed
+                    fps = 1.0 / elapsed if elapsed > 0 else 0
+                    
+                    # C-RC-003 FIX: Batch stats updates to reduce lock contention
+                    if time.time() - last_stats_update >= 1.0:  # Update every second
+                        with self.lock:
+                            self.stats[camera_id]['frames_captured'] += local_stats['frames_captured']
+                            self.stats[camera_id]['frames_dropped'] += local_stats['frames_dropped']
+                            self.stats[camera_id]['errors'] += local_stats['errors']
+                            self.stats[camera_id]['fps'] = fps
+                            self.stats[camera_id]['last_frame_time'] = time.time()
+                        # Reset local stats
+                        local_stats = {'frames_captured': 0, 'frames_dropped': 0, 'errors': 0}
+                        last_stats_update = time.time()
                     
                     # Call frame callbacks
                     for callback in self.frame_callbacks:
@@ -234,20 +265,26 @@ class CameraManager:
                     try:
                         frame_queue.get_nowait()  # Remove old frame
                         frame_queue.put_nowait((frame, time.time()))
-                        self.stats[camera_id]['frames_dropped'] += 1
+                        local_stats['frames_dropped'] += 1
                     except queue.Empty:
                         pass
                     except Exception as e:
                         logger.error(f"Error handling queue overflow: {e}")
             else:
                 # Read failed
-                self.stats[camera_id]['errors'] += 1
+                local_stats['errors'] += 1
                 
                 # Try to reconnect
                 self._handle_camera_error(camera_id)
                 
                 # Small delay before retry
                 time.sleep(1)
+        
+        # C-RC-003 FIX: Flush remaining stats before exit
+        with self.lock:
+            self.stats[camera_id]['frames_captured'] += local_stats['frames_captured']
+            self.stats[camera_id]['frames_dropped'] += local_stats['frames_dropped']
+            self.stats[camera_id]['errors'] += local_stats['errors']
     
     def _handle_camera_error(self, camera_id):
         """Handle camera read error"""

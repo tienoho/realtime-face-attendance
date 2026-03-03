@@ -16,4 +16,16 @@ def create_auth_blueprint(runtime):
     def login_route():
         return auth_service.login(runtime)
 
+    # H-AUTH-001: Add refresh token endpoint
+    @auth_bp.route("/refresh", methods=["POST"])
+    @runtime.limiter.limit("20 per minute")
+    def refresh_route():
+        return auth_service.refresh_access_token(runtime)
+
+    # H-AUTH-001: Add logout endpoint
+    @auth_bp.route("/logout", methods=["POST"])
+    @runtime.jwt_required()
+    def logout_route():
+        return auth_service.logout(runtime)
+
     return auth_bp

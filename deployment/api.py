@@ -702,10 +702,77 @@ app.register_blueprint(create_cameras_blueprint(runtime_module))
 
 @socketio.on('connect')
 def handle_connect():
-    with client_lock:
-        connected_clients.add(request.sid)
-    logger.info(f"Client connected: {request.sid}")
-    emit('connected', {'sid': request.sid})
+    """
+    Handle WebSocket connection with JWT authentication.
+    Rejects connections without valid token.
+    """
+    # C-SEC-001 FIX: WebSocket Authentication
+    try:
+        # Get token from query params or headers
+        token = request.args.get('token') or request.headers.get('Authorization', '').replace('Bearer ', '')
+        
+        if not token:
+            logger.warning(f"WS connection rejected: missing token from {request.remote_addr}")
+            return False  # Reject connection
+        
+        # Verify JWT token
+        try:
+            payload = jwt.decode(token, app.config['SECRET_KEY'], algorithms=['HS256'])
+            request.user_id = payload.get('user_id')
+            request.username = payload.get('username')
+            
+            # Rate limiting check per user
+            if not check_ws_rate_limit(request.user_id):
+                logger.warning(f"WS rate limit exceeded for user {request.user_id}")
+                return False
+            
+            logger.info(f"WS authenticated: user={request.username} sid={request.sid}")
+            
+        except ExpiredSignatureError:
+            logger.warning(f"WS connection rejected: expired token from {request.remote_addr}")
+            return False
+        except InvalidTokenError as e:
+            logger.warning(f"WS connection rejected: invalid token from {request.remote_addr}: {e}")
+            return False
+        
+        with client_lock:
+            connected_clients.add(request.sid)
+        
+        emit('connected', {
+            'sid': request.sid,
+            'user_id': request.user_id,
+            'authenticated': True
+        })
+        
+    except Exception as e:
+        logger.error(f"WS connection error: {e}")
+        return False
+
+
+def check_ws_rate_limit(user_id: str) -> bool:
+    """Simple rate limiting for WebSocket connections."""
+    # Implementation using in-memory store (use Redis in production)
+    now = time.time()
+    key = f"ws_rate_{user_id}"
+    
+    # Get recent connection attempts
+    if not hasattr(check_ws_rate_limit, 'rate_store'):
+        check_ws_rate_limit.rate_store = {}
+    
+    attempts = check_ws_rate_limit.rate_store.get(key, [])
+    
+    # Filter to last minute
+    attempts = [t for t in attempts if now - t < 60]
+    
+    # Check limit (max 10 connections per minute)
+    if len(attempts) >= 10:
+        return False
+    
+    # Record attempt
+    attempts.append(now)
+    check_ws_rate_limit.rate_store[key] = attempts
+    
+    return True
 
 @socketio.on('disconnect')
 def handle_disconnect():

@@ -24,6 +24,10 @@ interface AuthContextType {
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
 
+// C-SEC-004 FIX: Use memory-only storage instead of localStorage to prevent XSS
+// Token is stored in memory only, not persisted to disk
+const TOKEN_STORAGE_KEY = 'fa_token'
+
 // Helper to safely decode JWT without verification (just for reading claims)
 function decodeJWT(token: string): JWTPayload | null {
   try {
@@ -47,32 +51,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [token, setToken] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
 
+  // C-SEC-004 FIX: No localStorage usage - token is memory-only
+  // User must re-login after page refresh (security trade-off)
   useEffect(() => {
-    const storedToken = localStorage.getItem('fa_token')
-    if (storedToken) {
-      try {
-        // Decode and verify expiration
-        const payload = decodeJWT(storedToken)
-        
-        if (!payload) {
-          // Invalid token format, remove it
-          localStorage.removeItem('fa_token')
-        } else if (isTokenExpired(payload)) {
-          // Token expired, remove it
-          console.warn('Token expired, please login again')
-          localStorage.removeItem('fa_token')
-        } else {
-          // Token valid, set user
-          setUser({
-            user_id: payload.user_id,
-            username: payload.username,
-          })
-          setToken(storedToken)
-        }
-      } catch {
-        localStorage.removeItem('fa_token')
-      }
-    }
+    // Token not persisted - user must login again after refresh
+    // This prevents XSS from stealing tokens via localStorage
     setIsLoading(false)
   }, [])
 
@@ -85,7 +68,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       throw new Error('Invalid token received from server')
     }
     
-    localStorage.setItem('fa_token', response.token)
+    // C-SEC-004 FIX: Store token in memory only, not localStorage
     setToken(response.token)
     setUser({
       user_id: response.user_id,
@@ -94,7 +77,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const logout = useCallback(() => {
-    localStorage.removeItem('fa_token')
+    // C-SEC-004 FIX: Clear memory-only state
     setToken(null)
     setUser(null)
   }, [])

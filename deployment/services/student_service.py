@@ -1,10 +1,26 @@
 """Student and registration service layer."""
 
 import os
+import re
 import threading
+from pathlib import Path
 
 import psycopg2
 import pymysql
+
+# C-ED-001 FIX: File size limits for DoS prevention (in bytes)
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB per file
+MAX_TOTAL_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB total per request
+
+
+def validate_file_size(file_size: int, max_size: int = MAX_FILE_SIZE) -> tuple[bool, str]:
+    """Validate file size against maximum allowed."""
+    if file_size <= 0:
+        return False, "Invalid file size"
+    if file_size > max_size:
+        return False, f"File size exceeds maximum allowed ({max_size / (1024*1024):.1f}MB)"
+    return True, ""
+
 
 try:
     from deployment.services.dto_service import error_response, success_response
@@ -12,9 +28,58 @@ except ImportError:
     from services.dto_service import error_response, success_response
 
 
+# C-SEC-002 FIX: Path Traversal Prevention
+STUDENT_ID_PATTERN = re.compile(r'^[a-zA-Z0-9_-]{3,50}$')
+
+def validate_and_sanitize_student_id(student_id: str, base_folder: str) -> tuple[bool, Path, str]:
+    """
+    Validate student_id and return safe path.
+    
+    Returns:
+        tuple: (is_valid, safe_path, error_message)
+    """
+    if not student_id:
+        return False, Path(), "Student ID is required"
+    
+    # Check pattern (alphanumeric, hyphen, underscore only)
+    if not STUDENT_ID_PATTERN.match(student_id):
+        return False, Path(), "Invalid student_id format. Only alphanumeric, hyphen, and underscore allowed (3-50 chars)"
+    
+    # Check for path traversal attempts
+    if '..' in student_id or '/' in student_id or '\\' in student_id:
+        return False, Path(), "Invalid characters in student_id"
+    
+    # Build and validate path
+    try:
+        base_path = Path(base_folder).resolve()
+        target_path = (base_path / student_id).resolve()
+        
+        # Ensure target is within base folder
+        if not str(target_path).startswith(str(base_path)):
+            return False, Path(), "Path traversal detected"
+        
+        return True, target_path, ""
+    except Exception as e:
+        return False, Path(), f"Path validation error: {e}"
+
+
+def get_safe_student_folder(rt, student_id: str) -> tuple[bool, str, str]:
+    """Get safe folder path for student images."""
+    is_valid, safe_path, error = validate_and_sanitize_student_id(
+        student_id,
+        rt.app.config["UPLOAD_FOLDER"]
+    )
+    
+    if not is_valid:
+        return False, "", error
+    
+    return True, str(safe_path), ""
+
+
 def register_student(rt, current_user):
     del current_user  # reserved for audit/authorization extensions
 
+    conn = None
     try:
         if "file" not in rt.request.files:
             return error_response("MISSING_FILE", "No file provided", 400)
@@ -36,7 +101,12 @@ def register_student(rt, current_user):
         if not rt.allowed_file(file.filename):
             return error_response("INVALID_FILE_TYPE", "Invalid file type. Allowed: png, jpg, jpeg", 400)
 
+        # C-ED-001 FIX: Validate file size
         img_bytes = file.read()
+        valid, error = validate_file_size(len(img_bytes))
+        if not valid:
+            return error_response("FILE_TOO_LARGE", error, 413)
+
         nparr = rt.np.frombuffer(img_bytes, rt.np.uint8)
         img = rt.cv2.imdecode(nparr, rt.cv2.IMREAD_COLOR)
 
@@ -59,7 +129,11 @@ def register_student(rt, current_user):
                 (student_id, name),
             )
 
-            student_folder = os.path.join(rt.app.config["UPLOAD_FOLDER"], student_id)
+            # C-SEC-002 FIX: Use safe path validation
+            is_valid, student_folder, error = get_safe_student_folder(rt, student_id)
+            if not is_valid:
+                return error_response("INVALID_STUDENT_ID", error, 400)
+            
             os.makedirs(student_folder, exist_ok=True)
 
             saved_count = 0
@@ -73,7 +147,8 @@ def register_student(rt, current_user):
                 face_img = img[y1:y2, x1:x2]
                 gray_face = rt.cv2.cvtColor(face_img, rt.cv2.COLOR_BGR2GRAY)
 
-                img_filename = f"{student_id}_{rt.datetime.now().strftime('%Y%m%d%H%M%S')}.jpg"
+                # C-ED-002 FIX: Use UTC timezone
+                img_filename = f"{student_id}_{rt.datetime.now(rt.timezone.utc).strftime('%Y%m%d%H%M%S')}.jpg"
                 img_path = os.path.join(student_folder, img_filename)
                 rt.cv2.imwrite(img_path, gray_face)
 
@@ -124,6 +199,16 @@ def register_student_multi(rt, current_user):
         if len(files) > 20:
             return error_response("TOO_MANY_IMAGES", "Maximum 20 images allowed", 400)
 
+        # C-ED-001 FIX: Check total upload size
+        total_size = 0
+        for file in files:
+            file.seek(0, 2)  # Seek to end
+            total_size += file.tell()
+            file.seek(0)  # Reset to beginning
+        
+        if total_size > MAX_TOTAL_UPLOAD_SIZE:
+            return error_response("PAYLOAD_TOO_LARGE", f"Total upload size exceeds {MAX_TOTAL_UPLOAD_SIZE / (1024*1024):.0f}MB", 413)
+
         if len(files) < 3:
             rt.logger.warning(f"Only {len(files)} images provided, recommend at least 5-10")
 
@@ -156,6 +241,12 @@ def register_student_multi(rt, current_user):
 
             try:
                 img_bytes = file.read()
+                # C-ED-001 FIX: Validate individual file size
+                valid, error = validate_file_size(len(img_bytes))
+                if not valid:
+                    rt.logger.warning(f"Skipping image {i}: {error}")
+                    continue
+                
                 nparr = rt.np.frombuffer(img_bytes, rt.np.uint8)
                 img = rt.cv2.imdecode(nparr, rt.cv2.IMREAD_COLOR)
 
@@ -205,7 +296,11 @@ def register_student_multi(rt, current_user):
             except Exception as aug_err:
                 rt.logger.warning(f"Augmentation failed: {aug_err}")
 
-        student_folder = os.path.join(rt.app.config["UPLOAD_FOLDER"], student_id)
+        # C-SEC-002 FIX: Use safe path validation
+        is_valid, student_folder, error = get_safe_student_folder(rt, student_id)
+        if not is_valid:
+            return error_response("INVALID_STUDENT_ID", error, 400)
+        
         os.makedirs(student_folder, exist_ok=True)
 
         saved_count = 0
@@ -349,10 +444,15 @@ def register_face_capture(rt, current_user):
                     (student_id, name),
                 )
 
-        student_folder = os.path.join(rt.app.config["UPLOAD_FOLDER"], student_id)
+        # C-SEC-002 FIX: Use safe path validation
+        is_valid, student_folder, error = get_safe_student_folder(rt, student_id)
+        if not is_valid:
+            return error_response("INVALID_STUDENT_ID", error, 400)
+        
         os.makedirs(student_folder, exist_ok=True)
 
-        timestamp = rt.datetime.now().strftime("%Y%m%d%H%M%S")
+        # C-ED-002 FIX: Use UTC timezone
+        timestamp = rt.datetime.now(rt.timezone.utc).strftime("%Y%m%d%H%M%S")
         img_filename = f"{student_id}_{timestamp}.jpg"
         img_path = os.path.join(student_folder, img_filename)
         rt.cv2.imwrite(img_path, face_crop)
@@ -405,7 +505,8 @@ def register_face(rt, current_user):
         if not rt.allowed_file(file.filename):
             return error_response("INVALID_FILE_TYPE", "Invalid file type", 400)
 
-        timestamp = rt.datetime.now().strftime("%Y%m%d%H%M%S")
+        # C-ED-002 FIX: Use UTC timezone
+        timestamp = rt.datetime.now(rt.timezone.utc).strftime("%Y%m%d%H%M%S")
         filename = f"{student_id}_{timestamp}.jpg" if student_id else f"{timestamp}.jpg"
         filename = rt.secure_filename(filename)
         filepath = os.path.join(rt.app.config["UPLOAD_FOLDER"], filename)
