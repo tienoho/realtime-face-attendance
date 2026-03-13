@@ -319,41 +319,23 @@ class VectorStore:
         """
         Rebuild index to remove deleted items.
         Called when deleted ratio exceeds threshold.
-        """
-        logger.info(f"Compacting index, removing {len(self._deleted_ids)} deleted items")
         
-        try:
-            import faiss
-            
-            with self._index_lock, self._meta_lock:
-                # Create new index
-                base_index = faiss.IndexFlatIP(self.EMBEDDING_DIM)
-                new_index = faiss.IndexIDMap(base_index)
-                
-                # Copy non-deleted items
-                new_student_ids = {}
-                new_faiss_id_map = {}
-                new_next_id = 0
-                
-                for old_faiss_id, student_id in self._student_ids.items():
-                    if old_faiss_id not in self._deleted_ids:
-                        # Get embedding from old index
-                        # Note: FAISS doesn't support direct read, we need to reconstruct
-                        # For now, we skip reconstruction (would need to store embeddings separately)
-                        pass
-                
-                # Update index
-                self._index = new_index
-                self._student_ids = new_student_ids
-                self._faiss_id_map = new_faiss_id_map
-                self._next_id = new_next_id
-                self._deleted_ids.clear()
-            
-            self._save_index()
-            logger.info("Index compacted successfully")
-            
-        except Exception as e:
-            logger.error(f"Failed to compact index: {e}")
+        C-ML-002 FIX: Disabled because FAISS doesn't support direct read of vectors.
+        This prevents index from being wiped. Instead, we rely on lazy deletion
+        and search-time filtering (which already works correctly).
+        
+        TODO: For proper compaction, need to store embeddings separately in memory
+        or use faiss.IndexIDMap2 which supports remove_ids.
+        """
+        logger.info(
+            f"Compaction skipped: {len(self._deleted_ids)} items marked for deletion "
+            f"will be filtered at search time. To fully compact, restart server "
+            f"or implement embedding backup."
+        )
+        
+        # Clear deleted set on restart or implement proper rebuild
+        # For now, just schedule a save to persist the current state
+        self._save_index()
     
     def _schedule_save(self):
         """Schedule async save (simplified version)."""

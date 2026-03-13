@@ -121,7 +121,9 @@ class CameraManager:
     
     def start_camera(self, camera_id):
         """
-        Start capturing from a camera
+        Start capturing from a camera.
+        H-CAM-001 FIX: Idempotent - check if camera is already running.
+        H-CAM-003 FIX: Graceful handling when camera is not available.
         
         Args:
             camera_id: ID of camera to start
@@ -130,7 +132,24 @@ class CameraManager:
             if camera_id not in self.cameras:
                 logger.error(f"Camera {camera_id} not found")
                 return False
-
+            
+            # H-CAM-001 FIX: Check if camera is already running
+            if camera_id in self.capture_threads and self.capture_threads[camera_id].is_alive():
+                logger.warning(f"Camera {camera_id} is already running")
+                return True  # Already running, consider it success
+            
+            # Clean up any previous thread state
+            if camera_id in self.capture_threads:
+                old_thread = self.capture_threads[camera_id]
+                if old_thread.is_alive():
+                    # Wait for old thread to finish
+                    old_thread.join(timeout=1.0)
+                del self.capture_threads[camera_id]
+            
+            # Clean up any previous stop flag
+            if camera_id in self.stop_flags:
+                del self.stop_flags[camera_id]
+            
             # Create stop event for this camera
             stop_event = threading.Event()
             self.stop_flags[camera_id] = stop_event
@@ -139,7 +158,7 @@ class CameraManager:
             camera = self.cameras[camera_id]
             if not camera.connect():
                 logger.error(f"Failed to connect to camera {camera_id}")
-                del self.stop_flags[camera_id]
+                # H-CAM-003 FIX: Don't delete stop flag, allow retry
                 return False
 
             # Ensure capture loop can run when starting individual cameras.

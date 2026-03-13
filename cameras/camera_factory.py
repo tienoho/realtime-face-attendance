@@ -54,42 +54,109 @@ class BaseCamera(ABC):
 class USBCamera(BaseCamera):
     """USB/Webcam camera connector"""
     
+    @staticmethod
+    def find_available_camera(max_index=10):
+        """
+        Find an available camera device.
+        Returns device index or None if no camera found.
+        """
+        import os
+        
+        # Check for /dev/video* on Linux
+        if os.path.exists('/dev'):
+            video_devices = []
+            try:
+                for dev in os.listdir('/dev'):
+                    if dev.startswith('video'):
+                        video_devices.append(int(dev.replace('video', '')))
+            except Exception:
+                pass
+            
+            if video_devices:
+                logger.info(f"Found video devices: {video_devices}")
+                return min(video_devices)
+        
+        # Try OpenCV indices
+        for idx in range(max_index):
+            try:
+                cap = cv2.VideoCapture(idx)
+                if cap.isOpened():
+                    # Test if we can actually read a frame
+                    ret, frame = cap.read()
+                    cap.release()
+                    if ret and frame is not None:
+                        logger.info(f"Found working camera at index {idx}")
+                        return idx
+                else:
+                    cap.release()
+            except Exception:
+                pass
+        
+        return None
+    
     def __init__(self, camera_id, config):
         super().__init__(camera_id, config)
         self.device_index = config.get('device_index', 0)
         self.cap = None
+        self._auto_detect_attempted = False
         
     def connect(self):
-        """Connect to USB camera"""
+        """Connect to USB camera with auto-detection"""
         try:
+            # First try the configured device index
             self.cap = cv2.VideoCapture(self.device_index)
             
             if not self.cap.isOpened():
-                # Try alternative indices
-                for idx in range(5):
-                    if idx == self.device_index:
-                        continue
-                    new_cap = cv2.VideoCapture(idx)
-                    if new_cap.isOpened():
-                        if self.cap:
-                            self.cap.release()
-                        self.cap = new_cap
-                        self.device_index = idx
-                        break
-                    new_cap.release()
+                # Release the failed capture
+                if self.cap:
+                    self.cap.release()
+                    self.cap = None
+                
+                # Try to auto-detect available camera
+                if not self._auto_detect_attempted:
+                    logger.warning(f"Camera index {self.device_index} not available, trying auto-detect...")
+                    self._auto_detect_attempted = True
+                    
+                    detected_index = self.find_available_camera()
+                    if detected_index is not None:
+                        self.device_index = detected_index
+                        self.cap = cv2.VideoCapture(self.device_index)
+                    else:
+                        logger.error("No available camera found. Will retry on next connect attempt.")
+                        return False
+                else:
+                    # Already tried auto-detect, try all indices
+                    for idx in range(10):
+                        if idx == self.device_index:
+                            continue
+                        new_cap = cv2.VideoCapture(idx)
+                        if new_cap.isOpened():
+                            # Test read
+                            ret, frame = new_cap.read()
+                            if ret and frame is not None:
+                                if self.cap:
+                                    self.cap.release()
+                                self.cap = new_cap
+                                self.device_index = idx
+                                logger.info(f"Found working camera at index {idx}")
+                                break
+                            new_cap.release()
             
-            if self.cap.isOpened():
+            if self.cap and self.cap.isOpened():
                 # Set camera properties
                 width = self.config.get('width', 640)
                 height = self.config.get('height', 480)
                 self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
                 self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
                 
+                # Set buffer to 1 for low latency
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                
                 self.is_connected = True
                 logger.info(f"USB Camera {self.camera_id} connected at index {self.device_index}")
                 return True
             else:
-                logger.error(f"Failed to open USB camera {self.camera_id}")
+                logger.error(f"Failed to open USB camera {self.camera_id} - no camera available")
                 return False
                 
         except Exception as e:

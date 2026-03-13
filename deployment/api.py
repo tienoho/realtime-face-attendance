@@ -14,7 +14,6 @@ from functools import wraps
 # Third-party imports
 import cv2
 import numpy as np
-import pymysql
 import psycopg2  # For PostgreSQL support
 import jwt
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
@@ -64,7 +63,7 @@ except ImportError:
 # DATABASE TYPE SELECTION
 # ============================================================
 
-# Set DB_TYPE to 'postgresql' (default: postgresql for new deployments)
+# Set DB_TYPE to 'postgresql' (only PostgreSQL is supported)
 DB_TYPE = os.getenv('DB_TYPE', 'postgresql').lower()
 
 # Import appropriate database module
@@ -73,12 +72,11 @@ if DB_TYPE == 'postgresql':
         from database import get_db_connection, init_db_pool, close_db_pool, get_table_list, check_db_health
         logger.info(f"Using PostgreSQL database (DB_TYPE={DB_TYPE})")
     except ImportError as e:
-        logger.warning(f"PostgreSQL module error: {e}, falling back to MySQL")
-        DB_TYPE = 'mysql'
-        from database import get_db_connection, init_db_pool, close_db_pool
+        logger.error(f"PostgreSQL module error: {e}")
+        raise
 else:
-    from database import get_db_connection, init_db_pool, close_db_pool
-    logger.info(f"Using MySQL database (DB_TYPE={DB_TYPE})")
+    logger.error(f"Unsupported DB_TYPE: {DB_TYPE}. Only 'postgresql' is supported.")
+    raise ValueError(f"Unsupported DB_TYPE: {DB_TYPE}. Only 'postgresql' is supported.")
 
 # ============================================================
 # FLASK & SOCKETIO SETUP
@@ -145,8 +143,6 @@ DB_CONFIG = {
     'user': os.getenv('DB_USER', 'faceuser'),  # PostgreSQL default user
     'password': os.getenv('DB_PASSWORD', ''),
     'database': os.getenv('DB_NAME', 'face_attendance'),
-    'charset': 'utf8mb4',
-    'autocommit': True,
     'sslmode': os.getenv('DB_SSLMODE', 'prefer'),
     'client_encoding': 'UTF8',
 }
@@ -269,7 +265,7 @@ streaming_lock = threading.Lock()
 ENCODE_QUALITY = 80
 FRAME_RESIZE_WIDTH = 640
 
-# Use get_db_connection from the imported database module (mysql or postgresql)
+# Use get_db_connection from the imported database module (PostgreSQL only)
 
 def allowed_file(filename):
     if not isinstance(filename, str) or not filename:
@@ -392,12 +388,32 @@ def on_faces_detected(camera_id, result):
         })
 
 def on_faces_recognized(camera_id, recognized):
+    """
+    Callback when faces are recognized.
+    H-ATT-001 FIX: Also record attendance to database via attendance_engine.
+    """
     if recognized:
         for face in recognized:
+            person_id = face.get('person_id')
+            confidence = face.get('confidence')
+            
+            # H-ATT-001 FIX: Record attendance to database
+            if attendance_engine and person_id:
+                try:
+                    attendance_engine.record_attendance(
+                        person_id=person_id,
+                        camera_id=camera_id,
+                        confidence=confidence,
+                        metadata={'bbox': face.get('bbox')}
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to record attendance: {e}")
+            
+            # Also emit to socket for real-time notifications
             socketio.emit('attendance', {
                 'camera_id': camera_id,
-                'person_id': face.get('person_id'),
-                'confidence': face.get('confidence'),
+                'person_id': person_id,
+                'confidence': confidence,
                 'timestamp': time.time()
             })
 
@@ -470,7 +486,17 @@ def initialize_camera_system():
             det_threshold=0.5,
             recognition_threshold=0.6
         )
-        attendance_engine = AttendanceEngine(dedup_window=300)
+        
+        # H-ATT-001 FIX: Pass db_pool to attendance engine for DB persistence
+        # Get db_pool from the database module
+        try:
+            from database import get_db_pool
+            db_pool = get_db_pool()
+        except (ImportError, AttributeError):
+            db_pool = None
+            logger.warning("DB pool not available for attendance engine")
+        
+        attendance_engine = AttendanceEngine(db_pool=db_pool, dedup_window=300)
 
         camera_manager.register_frame_callback(on_frame_captured)
         camera_manager.register_frame_callback(on_frame_for_streaming)
@@ -972,10 +998,22 @@ if __name__ == '__main__':
     port = int(os.getenv('PORT', 5001))
     logger.info(f"Starting Face Attendance API on port {port}")
     
-    # Start default camera for testing
-    if CAMERA_SYSTEM_AVAILABLE and camera_manager:
-        camera_manager.add_camera('webcam1', 'usb', {'device_index': 0})
-        camera_manager.start_camera('webcam1')
+    # H-CAM-003 FIX: Only start default camera if explicitly enabled
+    # By default, don't start webcam to avoid errors when no camera available
+    enable_default_camera = os.getenv('ENABLE_DEFAULT_CAMERA', 'false').lower() == 'true'
+    
+    if CAMERA_SYSTEM_AVAILABLE and camera_manager and enable_default_camera:
+        # Try to add default webcam, but don't fail if no camera available
+        try:
+            camera_manager.add_camera('webcam1', 'usb', {'device_index': 0})
+            camera_manager.start_camera('webcam1')
+            logger.info("Default webcam added and started (ENABLE_DEFAULT_CAMERA=true)")
+        except Exception as e:
+            logger.warning(f"Could not start default webcam: {e}. Continuing without camera.")
+    elif CAMERA_SYSTEM_AVAILABLE and camera_manager:
+        logger.info("Camera system available but default camera disabled (ENABLE_DEFAULT_CAMERA=false)")
+    else:
+        logger.info("Camera system not available - running in headless mode")
     
     socketio.run(app, host='0.0.0.0', port=port, debug=False)
 

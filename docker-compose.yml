@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   # PostgreSQL Database
   db:
@@ -45,6 +43,8 @@ services:
       - LABEL_MAP_PATH=/app/model/label_map.json
       - CORS_ORIGINS=http://localhost,http://localhost:80,http://localhost:3000,http://localhost:5173
       - REDIS_URL=memory://
+    # NOTE: Camera passthrough is disabled for Docker Desktop on Windows
+    # To enable camera, use IP camera URL instead
     ports:
       - "5001:5001"
     volumes:
@@ -72,7 +72,7 @@ services:
     container_name: face-attendance-web
     restart: always
     ports:
-      - "80:80"
+      - "8033:80"
     depends_on:
       - backend
     networks:

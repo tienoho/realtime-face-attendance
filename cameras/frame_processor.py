@@ -17,24 +17,30 @@ import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, Future
 from queue import Queue
+from threading import Semaphore
 
 logger = logging.getLogger(__name__)
 
 
-# C-ML-001 FIX: Bounded ThreadPoolExecutor to prevent unbounded queue growth
-class BoundedThreadPoolExecutor(ThreadPoolExecutor):
+# C-ML-001 FIX: Use Semaphore + ThreadPoolExecutor for proper backpressure
+class BoundedThreadPoolExecutor:
     """
     ThreadPoolExecutor with bounded queue to prevent memory overflow.
-    
-    When queue is full, new tasks are rejected instead of growing indefinitely.
+    Uses Semaphore for backpressure control instead of trying to access internal classes.
     """
     
     def __init__(self, max_workers=None, max_queue_size=100, thread_name_prefix=''):
-        super().__init__(max_workers=max_workers, thread_name_prefix=thread_name_prefix)
+        self._max_workers = max_workers or 4
         self._max_queue_size = max_queue_size
-        self._work_queue = Queue(maxsize=max_queue_size)
+        self._executor = ThreadPoolExecutor(
+            max_workers=self._max_workers,
+            thread_name_prefix=thread_name_prefix
+        )
+        self._semaphore = Semaphore(max_queue_size)
         self._dropped_tasks = 0
         self._dropped_lock = threading.Lock()
+        self._shutdown = False
+        self._shutdown_lock = threading.Lock()
     
     def submit(self, fn, *args, **kwargs):
         """
@@ -47,11 +53,8 @@ class BoundedThreadPoolExecutor(ThreadPoolExecutor):
             if self._shutdown:
                 raise RuntimeError('cannot schedule new futures after shutdown')
             
-            # Try to put work item in queue without blocking
-            try:
-                work_item = self._WorkItem(None, fn, args, kwargs, None)
-                self._work_queue.put_nowait(work_item)
-            except:
+            # Try to acquire semaphore without blocking
+            if not self._semaphore.acquire(blocking=False):
                 # Queue is full - apply backpressure
                 with self._dropped_lock:
                     self._dropped_tasks += 1
@@ -64,12 +67,20 @@ class BoundedThreadPoolExecutor(ThreadPoolExecutor):
                     )
                 return None  # Signal caller to skip this frame
             
-            # Create future and set callback
-            f = Future()
-            f._work_item = work_item
-            work_item.future = f
+            # Wrap the function to release semaphore when done
+            def wrapped_fn():
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    self._semaphore.release()
             
-            return f
+            return self._executor.submit(wrapped_fn)
+    
+    def shutdown(self, wait=True):
+        """Shutdown the executor."""
+        with self._shutdown_lock:
+            self._shutdown = True
+        self._executor.shutdown(wait=wait)
     
     def get_dropped_count(self):
         """Get number of dropped tasks due to backpressure."""

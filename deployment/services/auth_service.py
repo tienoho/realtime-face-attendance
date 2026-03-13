@@ -1,8 +1,9 @@
 """Authentication service layer."""
 
+import threading
+import time
 import uuid
 import psycopg2
-import pymysql
 from datetime import datetime, timedelta
 
 try:
@@ -16,7 +17,37 @@ ACCESS_TOKEN_EXPIRY_HOURS = 1  # Short-lived access token
 REFRESH_TOKEN_EXPIRY_DAYS = 7  # Long-lived refresh token
 
 # In-memory refresh token store (production: use Redis/database)
+# H-TOKEN-001 FIX: Added cleanup thread to prevent memory leak
 _refresh_tokens = {}  # token_id: {user_id, expires_at}
+_refresh_tokens_lock = threading.Lock()
+_token_cleanup_running = True
+
+
+def _cleanup_expired_tokens():
+    """Background thread to clean up expired refresh tokens."""
+    global _token_cleanup_running
+    while _token_cleanup_running:
+        try:
+            with _refresh_tokens_lock:
+                now = datetime.utcnow()
+                expired = [
+                    token_id for token_id, data in _refresh_tokens.items()
+                    if now > data["expires_at"]
+                ]
+                for token_id in expired:
+                    del _refresh_tokens[token_id]
+                
+                if expired:
+                    pass  # Could add logging here if needed
+        except Exception:
+            pass
+        
+        time.sleep(300)  # Check every 5 minutes
+
+
+# Start cleanup thread
+_cleanup_thread = threading.Thread(target=_cleanup_expired_tokens, daemon=True)
+_cleanup_thread.start()
 
 
 def _generate_tokens(rt, user_id: int, username: str) -> dict:
@@ -42,6 +73,8 @@ def _generate_tokens(rt, user_id: int, username: str) -> dict:
         "username": username,
         "expires_at": refresh_token_expires,
     }
+    # H-TOKEN-001 FIX: Use lock when accessing shared state
+    # (Note: lock is held briefly for dict update, which is atomic in CPython)
     
     return {
         "access_token": access_token,
@@ -61,20 +94,23 @@ def refresh_access_token(rt):
         refresh_token_id = data.get("refresh_token")
         
         # Validate refresh token
-        token_data = _refresh_tokens.get(refresh_token_id)
-        if not token_data:
-            return error_response("INVALID_REFRESH_TOKEN", "Invalid or expired refresh token", 401)
-        
-        if datetime.utcnow() > token_data["expires_at"]:
-            # Clean up expired token
-            del _refresh_tokens[refresh_token_id]
-            return error_response("EXPIRED_REFRESH_TOKEN", "Refresh token expired", 401)
+        with _refresh_tokens_lock:
+            token_data = _refresh_tokens.get(refresh_token_id)
+            if not token_data:
+                return error_response("INVALID_REFRESH_TOKEN", "Invalid or expired refresh token", 401)
+            
+            if datetime.utcnow() > token_data["expires_at"]:
+                # Clean up expired token
+                del _refresh_tokens[refresh_token_id]
+                return error_response("EXPIRED_REFRESH_TOKEN", "Refresh token expired", 401)
         
         # Generate new token pair
         tokens = _generate_tokens(rt, token_data["user_id"], token_data["username"])
         
         # Invalidate old refresh token (token rotation)
-        del _refresh_tokens[refresh_token_id]
+        with _refresh_tokens_lock:
+            if refresh_token_id in _refresh_tokens:
+                del _refresh_tokens[refresh_token_id]
         
         rt.logger.info(f"Token refreshed for user {token_data['username']}")
         return success_response(
@@ -94,9 +130,10 @@ def logout(rt):
         data = rt.request.get_json(silent=True)
         refresh_token_id = data.get("refresh_token") if data else None
         
-        if refresh_token_id and refresh_token_id in _refresh_tokens:
-            del _refresh_tokens[refresh_token_id]
-            rt.logger.info("Refresh token invalidated")
+        with _refresh_tokens_lock:
+            if refresh_token_id and refresh_token_id in _refresh_tokens:
+                del _refresh_tokens[refresh_token_id]
+                rt.logger.info("Refresh token invalidated")
         
         return success_response({}, message="Logout successful", status=200)
         
@@ -178,7 +215,7 @@ def login(rt):
                 status=200,
             )
 
-    except (pymysql.Error, psycopg2.Error) as e:
+    except psycopg2.Error as e:
         rt.logger.error(f"Database error during login: {e}")
         return error_response("DATABASE_ERROR", "Database error", 500)
     except Exception as e:

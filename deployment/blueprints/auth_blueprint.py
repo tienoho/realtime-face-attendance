@@ -24,7 +24,7 @@ def create_auth_blueprint(runtime):
 
     # H-AUTH-001: Add logout endpoint
     @auth_bp.route("/logout", methods=["POST"])
-    @runtime.jwt_required()
+    @runtime.limiter.limit("20 per minute")
     def logout_route():
         return auth_service.logout(runtime)
 

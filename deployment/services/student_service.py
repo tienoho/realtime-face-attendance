@@ -7,7 +7,6 @@ from pathlib import Path
 
 import cv2
 import psycopg2
-import pymysql
 
 # C-ED-001 FIX: File size limits for DoS prevention (in bytes)
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB per file
@@ -16,6 +15,10 @@ MAX_TOTAL_UPLOAD_SIZE = 100 * 1024 * 1024  # 100MB total per request
 # H-PERF-001 FIX: Image resizing configuration
 MAX_IMAGE_DIMENSION = 1920  # Max width/height for processed images
 TARGET_FACE_SIZE = 640  # Target size for face crops
+
+# H-TR-001 FIX: Training lock to prevent concurrent training
+_training_lock = threading.Lock()
+_training_in_progress = False
 
 
 def resize_image_if_needed(img, max_dim=MAX_IMAGE_DIMENSION):
@@ -217,7 +220,7 @@ def register_student(rt, current_user):
             status=201,
         )
 
-    except (pymysql.Error, psycopg2.Error) as e:
+    except psycopg2.Error as e:
         rt.logger.error(f"Database error during registration: {e}")
         return error_response("DATABASE_ERROR", "Database error", 500)
     except Exception as e:
@@ -404,6 +407,15 @@ def register_student_multi(rt, current_user):
                 pipeline_result = {"status": "error", "message": str(pipeline_err)}
 
         def run_training():
+            # H-TR-001 FIX: Use lock to prevent concurrent training
+            global _training_in_progress
+            
+            with _training_lock:
+                if _training_in_progress:
+                    rt.logger.info("Training already in progress, skipping this request")
+                    return
+                _training_in_progress = True
+            
             try:
                 training_result = rt.train_face_recognition_model()
                 if training_result.get("status") == "success":
@@ -416,6 +428,9 @@ def register_student_multi(rt, current_user):
                     )
             except Exception as train_err:
                 rt.logger.error(f"Background training error: {train_err}")
+            finally:
+                with _training_lock:
+                    _training_in_progress = False
 
         threading.Thread(target=run_training, daemon=True).start()
 
@@ -434,7 +449,7 @@ def register_student_multi(rt, current_user):
             status=201,
         )
 
-    except (pymysql.Error, psycopg2.Error) as e:
+    except psycopg2.Error as e:
         rt.logger.error(f"Database error during multi-registration: {e}")
         return error_response("DATABASE_ERROR", "Database error", 500)
     except Exception as e:

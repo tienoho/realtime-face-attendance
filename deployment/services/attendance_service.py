@@ -1,7 +1,6 @@
 """Attendance service layer."""
 
 import psycopg2
-import pymysql
 
 try:
     from deployment.services.dto_service import error_response, success_response
@@ -113,7 +112,7 @@ def mark_attendance(rt, current_user):
         }
         return success_response(payload, message="Attendance marked successfully", status=200)
 
-    except (pymysql.Error, psycopg2.Error) as e:
+    except psycopg2.Error as e:
         rt.logger.error(f"Database error during attendance: {e}")
         return error_response("DATABASE_ERROR", "Database error", 500)
     except Exception as e:

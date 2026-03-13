@@ -9,12 +9,15 @@ import {
   Typography,
   Alert,
   CircularProgress,
+  FormControlLabel,
+  Checkbox,
 } from '@mui/material'
 import { useAuth } from '../contexts/AuthContext'
 
 export default function Login() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [rememberMe, setRememberMe] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const { login } = useAuth()
@@ -23,10 +26,28 @@ export default function Login() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
     setError('')
+    
+    // Input validation
+    if (!username.trim() || !password.trim()) {
+      setError('Username and password are required')
+      return
+    }
+    
+    if (username.length < 3 || username.length > 50) {
+      setError('Username must be between 3 and 50 characters')
+      return
+    }
+    
+    if (password.length < 6) {
+      setError('Password must be at least 6 characters')
+      return
+    }
+    
     setLoading(true)
 
     try {
-      await login(username, password)
+      // SESSION-PERSISTENCE FIX: Pass rememberMe flag to login
+      await login(username, password, rememberMe)
       navigate('/dashboard')
     } catch (err) {
       setError('Invalid username or password')
@@ -69,6 +90,8 @@ export default function Login() {
               margin="normal"
               required
               autoFocus
+              inputProps={{ maxLength: 50 }}
+              autoComplete="username"
             />
             <TextField
               fullWidth
@@ -78,6 +101,20 @@ export default function Login() {
               onChange={(e) => setPassword(e.target.value)}
               margin="normal"
               required
+              inputProps={{ minLength: 6 }}
+              autoComplete="current-password"
+            />
+            {/* SESSION-PERSISTENCE FIX: Add Remember Me checkbox */}
+            <FormControlLabel
+              control={
+                <Checkbox
+                  checked={rememberMe}
+                  onChange={(e) => setRememberMe(e.target.checked)}
+                  color="primary"
+                />
+              }
+              label="Remember me"
+              sx={{ mt: 1 }}
             />
             <Button
               fullWidth
@@ -85,7 +122,7 @@ export default function Login() {
               variant="contained"
               size="large"
               disabled={loading}
-              sx={{ mt: 3 }}
+              sx={{ mt: 1 }}
             >
               {loading ? <CircularProgress size={24} color="inherit" /> : 'Sign In'}
             </Button>

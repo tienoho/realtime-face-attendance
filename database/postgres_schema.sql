@@ -121,7 +121,7 @@ COMMENT ON TABLE training_images IS 'Training images for face recognition';
 -- WARNING: Change this password immediately after deployment!
 -- ============================================================
 INSERT INTO users (username, password_hash) 
-SELECT 'admin', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYqKx8pKv6u' 
+SELECT 'admin', '$2b$12$eHdR0/jXQEJjGYdkEwSVVOYuGRJIE0VrnkavUoTvjBD2E2Z74rENu' 
 WHERE NOT EXISTS (SELECT 1 FROM users WHERE username = 'admin');
 
 -- ============================================================

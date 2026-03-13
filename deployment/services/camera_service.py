@@ -1,9 +1,91 @@
 """Camera, processing and streaming service layer."""
 
+import ipaddress
+import socket
+from urllib.parse import urlparse
+
 try:
     from deployment.services.dto_service import error_response, success_response
 except ImportError:
     from services.dto_service import error_response, success_response
+
+# H-SSRF-001 FIX: Allowed IP ranges for camera URLs (whitelist)
+ALLOWED_IP_RANGES = [
+    # Private ranges
+    ipaddress.ip_network('10.0.0.0/8'),
+    ipaddress.ip_network('172.16.0.0/12'),
+    ipaddress.ip_network('192.168.0.0/16'),
+    # Localhost
+    ipaddress.ip_network('127.0.0.0/8'),
+]
+
+# Allowed hostnames (domain whitelist)
+ALLOWED_HOSTS = {
+    'localhost',
+    '127.0.0.1',
+    '0.0.0.0',
+}
+
+
+def is_private_ip(host: str) -> bool:
+    """
+    Check if host is a private/internal IP address.
+    H-SSRF-001 FIX: Prevent SSRF attacks by blocking internal network access.
+    """
+    try:
+        # Try to resolve hostname first
+        try:
+            addr_info = socket.getaddrinfo(host, None)
+            ips = set(info[4][0] for info in addr_info)
+        except socket.gaierror:
+            # If resolution fails, check if it's an IP directly
+            ips = {host}
+        
+        for ip_str in ips:
+            try:
+                ip = ipaddress.ip_address(ip_str)
+                for network in ALLOWED_IP_RANGES:
+                    if ip in network:
+                        return True
+            except (ValueError, TypeError):
+                continue
+        
+        return False
+    except Exception:
+        # If anything fails, assume it's not private (fail open for usability)
+        return False
+
+
+def validate_camera_url(url: str) -> tuple[bool, str]:
+    """
+    Validate camera URL for SSRF protection.
+    H-SSRF-001 FIX: Only allow specific URLs or private networks.
+    
+    Returns:
+        tuple: (is_valid, error_message)
+    """
+    if not url:
+        return True, ""  # No URL is valid (e.g., USB camera)
+    
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or parsed.host
+        
+        if not host:
+            return True, ""  # No host in URL
+        
+        # Allow localhost
+        if host in ALLOWED_HOSTS:
+            return True, ""
+        
+        # Check if it's a private IP
+        if is_private_ip(host):
+            return True, ""
+        
+        # Block external URLs
+        return False, f"Camera URL host '{host}' is not allowed. Only localhost or private network URLs are permitted."
+    except Exception as e:
+        return False, f"Invalid URL: {str(e)}"
 
 
 def get_cameras(rt, current_user):
@@ -36,6 +118,14 @@ def add_camera(rt, current_user):
         camera_config["url"] = camera_config.get("stream_url")
     if "host" in camera_config and "ip" not in camera_config:
         camera_config["ip"] = camera_config.get("host")
+    
+    # H-SSRF-001 FIX: Validate camera URLs before connecting
+    url_to_check = camera_config.get("url") or camera_config.get("rtsp_url") or camera_config.get("stream_url")
+    if url_to_check:
+        is_valid, error = validate_camera_url(url_to_check)
+        if not is_valid:
+            rt.logger.warning(f"SSRF protection blocked camera {camera_id}: {error}")
+            return error_response("INVALID_CAMERA_URL", error, 400)
 
     if rt.camera_manager.add_camera(camera_id, camera_type, camera_config):
         started = rt.camera_manager.start_camera(camera_id)

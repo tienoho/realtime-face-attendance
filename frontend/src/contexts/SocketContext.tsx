@@ -1,5 +1,7 @@
-import { createContext, useContext, useEffect, useState, ReactNode, useCallback } from 'react'
+import { createContext, useContext, useEffect, useState, ReactNode, useCallback, useRef } from 'react'
 import { io, Socket } from 'socket.io-client'
+import { tokenStore } from '../api/tokenStore'
+import { useAuth } from './AuthContext'
 
 const SOCKET_URL = import.meta.env.VITE_SOCKET_URL || 'http://localhost:5001'
 
@@ -39,13 +41,25 @@ const SocketContext = createContext<SocketContextType | undefined>(undefined)
 export function SocketProvider({ children }: { children: ReactNode }) {
   const [socket, setSocket] = useState<Socket | null>(null)
   const [isConnected, setIsConnected] = useState(false)
+  const { isLoading: authLoading } = useAuth()
+  const hasConnectedRef = useRef(false)
 
+  // Chỉ connect socket sau khi auth loading hoàn tất
   useEffect(() => {
-    const token = localStorage.getItem('fa_token')
-    if (!token) return
-
+    // Đợi auth load xong mới connect
+    if (authLoading || hasConnectedRef.current) return
+    
+    const token = tokenStore.getToken()
+    if (!token) {
+      // Không có token, không connect
+      return
+    }
+    
+    hasConnectedRef.current = true
+    
     const newSocket = io(SOCKET_URL, {
-      auth: { token },
+      // Send token via query parameter for server to read
+      query: { token },
       transports: ['websocket'],
       // Reconnection configuration
       reconnection: true,
@@ -79,7 +93,7 @@ export function SocketProvider({ children }: { children: ReactNode }) {
       // Handle authentication errors
       if (error.message === 'Invalid token' || error.message === 'Token has expired') {
         console.warn('Socket auth error, clearing token')
-        localStorage.removeItem('fa_token')
+        tokenStore.clearToken()
         newSocket.close()
       }
     })
@@ -101,7 +115,21 @@ export function SocketProvider({ children }: { children: ReactNode }) {
 
     setSocket(newSocket)
 
+    // C-AUTH-001 FIX: Listen for token changes to reconnect socket
+    const unsubscribe = tokenStore.addListener((newToken) => {
+      if (!newToken && newSocket.connected) {
+        // Token cleared (logout), disconnect socket
+        newSocket.close()
+        setSocket(null)
+        setIsConnected(false)
+      } else if (newToken && !newSocket.connected) {
+        // Token set, reconnect socket
+        newSocket.connect()
+      }
+    })
+
     return () => {
+      unsubscribe()
       newSocket.close()
     }
   }, [])
