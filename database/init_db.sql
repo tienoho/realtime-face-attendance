@@ -19,7 +19,25 @@ CREATE TABLE IF NOT EXISTS users (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ============================================================
--- Students table for face registration
+-- Staffs table for face registration (replaces students)
+-- ============================================================
+CREATE TABLE IF NOT EXISTS staffs (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    staff_id VARCHAR(50) UNIQUE NOT NULL,
+    name VARCHAR(100) NOT NULL,
+    face_image_path VARCHAR(255),
+    department VARCHAR(100),
+    position VARCHAR(100),
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_staff_id (staff_id),
+    INDEX idx_is_active (is_active),
+    INDEX idx_department (department)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ============================================================
+-- Students table (deprecated - kept for backward compatibility)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS students (
     id INT PRIMARY KEY AUTO_INCREMENT,
@@ -34,11 +52,11 @@ CREATE TABLE IF NOT EXISTS students (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ============================================================
--- Attendance table
+-- Attendance table (now uses staff_id)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS Attendance (
     id INT PRIMARY KEY AUTO_INCREMENT,
-    student_id VARCHAR(50) NOT NULL,
+    staff_id VARCHAR(50) NOT NULL,
     enrollment VARCHAR(100),
     name VARCHAR(50),
     date VARCHAR(20) NOT NULL,
@@ -47,9 +65,9 @@ CREATE TABLE IF NOT EXISTS Attendance (
     status VARCHAR(20) DEFAULT 'Present',
     confidence_score FLOAT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (student_id) REFERENCES students(student_id),
+    FOREIGN KEY (staff_id) REFERENCES staffs(staff_id),
     INDEX idx_date (date),
-    INDEX idx_student_date (student_id, date),
+    INDEX idx_staff_date (staff_id, date),
     INDEX idx_subject (subject)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -63,14 +81,14 @@ SELECT 'admin', '$2b$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewY5GyYqKx8pKv6u'
 WHERE NOT EXISTS (SELECT 1 FROM users WHERE username = 'admin');
 
 -- ============================================================
--- Create training images table (for API)
+-- Create training images table (now uses staff_id)
 -- ============================================================
 CREATE TABLE IF NOT EXISTS training_images (
     id INT PRIMARY KEY AUTO_INCREMENT,
-    student_id VARCHAR(50) NOT NULL,
+    staff_id VARCHAR(50) NOT NULL,
     image_path VARCHAR(255) NOT NULL,
     is_used_for_training BOOLEAN DEFAULT TRUE,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (student_id) REFERENCES students(student_id),
-    INDEX idx_student (student_id)
+    FOREIGN KEY (staff_id) REFERENCES staffs(staff_id),
+    INDEX idx_staff (staff_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

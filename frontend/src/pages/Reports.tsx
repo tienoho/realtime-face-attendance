@@ -48,9 +48,9 @@ export default function Reports() {
   const exportCSV = () => {
     if (!records.length) return
     
-    const headers = ['Student ID', 'Name', 'Date', 'Time', 'Subject', 'Status', 'Confidence']
+    const headers = ['Staff ID', 'Name', 'Date', 'Time', 'Subject', 'Status', 'Confidence']
     const rows = records.map(r => [
-      r.student_id,
+      r.staff_id,
       r.name,
       r.date,
       r.time,
@@ -215,7 +215,7 @@ export default function Reports() {
           <Table>
             <TableHead>
               <TableRow>
-                <TableCell>Student ID</TableCell>
+                <TableCell>Staff ID</TableCell>
                 <TableCell>Name</TableCell>
                 <TableCell>Time</TableCell>
                 <TableCell>Subject</TableCell>
@@ -226,7 +226,7 @@ export default function Reports() {
             <TableBody>
               {records.map((record, index) => (
                 <TableRow key={index}>
-                  <TableCell>{record.student_id}</TableCell>
+                  <TableCell>{record.staff_id}</TableCell>
                   <TableCell>{record.name}</TableCell>
                   <TableCell>{record.time}</TableCell>
                   <TableCell>{record.subject}</TableCell>

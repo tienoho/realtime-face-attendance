@@ -272,19 +272,22 @@ def allowed_file(filename):
         return False
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in app.config['ALLOWED_EXTENSIONS']
 
-def validate_student_id(student_id):
-    if not isinstance(student_id, str):
-        return False, "Student ID must be 3-50 characters"
-    student_id = student_id.strip()
-    if not student_id or len(student_id) < 3 or len(student_id) > 50:
-        return False, "Student ID must be 3-50 characters"
-    if not STUDENT_ID_PATTERN.match(student_id):
-        return False, "Student ID can only contain alphanumeric, underscore, hyphen"
-    student_id_lower = student_id.lower()
+def validate_staff_id(staff_id):
+    if not isinstance(staff_id, str):
+        return False, "Staff ID must be 3-50 characters"
+    staff_id = staff_id.strip()
+    if not staff_id or len(staff_id) < 3 or len(staff_id) > 50:
+        return False, "Staff ID must be 3-50 characters"
+    if not STUDENT_ID_PATTERN.match(staff_id):
+        return False, "Staff ID can only contain alphanumeric, underscore, hyphen"
+    staff_id_lower = staff_id.lower()
     for word in FORBIDDEN_STUDENT_ID_TOKENS:
-        if word in student_id_lower:
-            return False, "Student ID contains forbidden characters"
+        if word in staff_id_lower:
+            return False, "Staff ID contains forbidden characters"
     return True, None
+
+# Alias for backward compatibility
+validate_student_id = validate_staff_id
 
 def validate_name(name):
     if not isinstance(name, str):
@@ -361,12 +364,12 @@ def recognize_face(gray_face):
             logger.error("Label map is unavailable. Rejecting LBPH recognition result.")
             return None, 0
 
-        student_id = label_map.get(str(label))
-        if not student_id:
+        staff_id = label_map.get(str(label))
+        if not staff_id:
             logger.error(f"Predicted label {label} is not in label map. Rejecting recognition result.")
             return None, 0
 
-        return student_id, confidence
+        return staff_id, confidence
     except Exception as e:
         logger.error(f"Face recognition error: {e}")
         return None, 0
@@ -545,18 +548,18 @@ def train_face_recognition_model():
         # Get all image files
         faces = []
         labels = []
-        label_to_student_id = {}
+        label_to_staff_id = {}
         
-        # Walk through all subdirectories (each student has their own folder)
-        student_ids = sorted([
-            student_id for student_id in os.listdir(training_folder)
-            if os.path.isdir(os.path.join(training_folder, student_id))
+        # Walk through all subdirectories (each staff has their own folder)
+        staff_ids = sorted([
+            staff_id for staff_id in os.listdir(training_folder)
+            if os.path.isdir(os.path.join(training_folder, staff_id))
         ])
 
-        for idx, student_id in enumerate(student_ids, start=1):
-            student_path = os.path.join(training_folder, student_id)
+        for idx, staff_id in enumerate(staff_ids, start=1):
+            staff_path = os.path.join(training_folder, staff_id)
             label = idx
-            label_to_student_id[label] = student_id
+            label_to_staff_id[label] = staff_id
             
             # Load all images for this student
             for img_name in os.listdir(student_path):
@@ -584,11 +587,11 @@ def train_face_recognition_model():
         # Save the model
         recognizer.save(model_path)
 
-        # Persist label -> student_id mapping for inference.
+        # Persist label -> staff_id mapping for inference.
         label_map_dir = os.path.dirname(label_map_path)
         if label_map_dir:
             os.makedirs(label_map_dir, exist_ok=True)
-        serializable_label_map = {str(k): v for k, v in label_to_student_id.items()}
+        serializable_label_map = {str(k): v for k, v in label_to_staff_id.items()}
         with open(label_map_path, 'w', encoding='utf-8') as f:
             json.dump(serializable_label_map, f, indent=2)
         
@@ -603,7 +606,7 @@ def train_face_recognition_model():
             'status': 'success',
             'message': 'Model trained successfully',
             'images_trained': len(faces),
-            'unique_labels': len(label_to_student_id)
+            'unique_labels': len(label_to_staff_id)
         }
         
     except Exception as e:
@@ -707,18 +710,18 @@ def index():
 # Register API blueprints (route layer)
 try:
     from deployment.blueprints.auth_blueprint import create_auth_blueprint
-    from deployment.blueprints.students_blueprint import create_students_blueprint
+    from deployment.blueprints.staffs_blueprint import create_staffs_blueprint
     from deployment.blueprints.attendance_blueprint import create_attendance_blueprint
     from deployment.blueprints.cameras_blueprint import create_cameras_blueprint
 except ImportError:
     from blueprints.auth_blueprint import create_auth_blueprint
-    from blueprints.students_blueprint import create_students_blueprint
+    from blueprints.staffs_blueprint import create_staffs_blueprint
     from blueprints.attendance_blueprint import create_attendance_blueprint
     from blueprints.cameras_blueprint import create_cameras_blueprint
 
 runtime_module = sys.modules[__name__]
 app.register_blueprint(create_auth_blueprint(runtime_module))
-app.register_blueprint(create_students_blueprint(runtime_module))
+app.register_blueprint(create_staffs_blueprint(runtime_module))
 app.register_blueprint(create_attendance_blueprint(runtime_module))
 app.register_blueprint(create_cameras_blueprint(runtime_module))
 

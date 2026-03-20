@@ -373,7 +373,7 @@ class FrameProcessor:
                     {
                         'bbox': (int(r.bbox[0]), int(r.bbox[1]), 
                                 int(r.bbox[2]-r.bbox[0]), int(r.bbox[3]-r.bbox[1])),
-                        'person_id': r.student_id,
+                        'person_id': r.staff_id,
                         'confidence': float(r.confidence)
                     }
                     for r in results if r.is_recognized
@@ -437,7 +437,7 @@ class FrameProcessor:
                     {
                         'bbox': (int(r.bbox[0]), int(r.bbox[1]), 
                                 int(r.bbox[2]-r.bbox[0]), int(r.bbox[3]-r.bbox[1])),
-                        'person_id': r.student_id,
+                        'person_id': r.staff_id,
                         'confidence': float(r.confidence)
                     }
                     for r in results if r.is_recognized

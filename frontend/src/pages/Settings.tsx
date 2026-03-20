@@ -197,7 +197,7 @@ export default function Settings() {
                 label="Late Threshold (minutes)"
                 type="number"
                 defaultValue={15}
-                helperText="Students arriving after this time are marked as late"
+                helperText="Staffs arriving after this time are marked as late"
               />
             </Grid>
 
@@ -238,7 +238,7 @@ export default function Settings() {
             <Grid item xs={12}>
               <FormControlLabel
                 control={<Switch defaultChecked />}
-                label="Email notifications for new students"
+                label="Email notifications for new staffs"
               />
             </Grid>
 

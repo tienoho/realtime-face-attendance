@@ -20,7 +20,7 @@ import {
 } from '@mui/icons-material'
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts'
 import { camerasApi } from '../api/cameras'
-import { studentsApi } from '../api/students'
+import { staffsApi } from '../api/staffs'
 import { attendanceApi } from '../api/attendance'
 import { useSocket } from '../contexts/SocketContext'
 import dayjs from 'dayjs'
@@ -173,9 +173,9 @@ export default function Dashboard() {
     queryFn: camerasApi.getCameras,
   })
 
-  const { data: studentsData, isLoading: studentsLoading } = useQuery({
-    queryKey: ['students'],
-    queryFn: studentsApi.getStudents,
+  const { data: staffsData, isLoading: staffsLoading } = useQuery({
+    queryKey: ['staffs'],
+    queryFn: staffsApi.getStaffs,
   })
 
   const { data: attendanceData, isLoading: attendanceLoading } = useQuery({
@@ -199,10 +199,10 @@ export default function Dashboard() {
   }))
 
   const activeCameras = camerasData?.cameras ? Object.values(camerasData.cameras).filter(c => c.connected).length : 0
-  const totalStudents = studentsData?.students?.length || 0
+  const totalStaffs = staffsData?.staffs?.length || 0
   const todayAttendance = attendanceData?.count || 0
 
-  const isLoading = camerasLoading || studentsLoading || attendanceLoading
+  const isLoading = camerasLoading || staffsLoading || attendanceLoading
 
   if (isLoading) {
     return <DashboardSkeleton />
@@ -224,8 +224,8 @@ export default function Dashboard() {
       <Grid container spacing={3} sx={{ mb: 4 }}>
         <Grid item xs={12} sm={6} md={3}>
           <StatCard
-            title="Total Students"
-            value={totalStudents}
+            title="Total Staffs"
+            value={totalStaffs}
             icon={<PeopleIcon sx={{ fontSize: 28, color: 'white' }} />}
             gradient="linear-gradient(135deg, #3B82F6 0%, #1D4ED8 100%)"
             trend="+12% from last month"

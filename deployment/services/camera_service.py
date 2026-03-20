@@ -2,6 +2,7 @@
 
 import ipaddress
 import socket
+import threading
 from urllib.parse import urlparse
 
 try:
@@ -347,3 +348,126 @@ def update_streaming_config(rt, current_user):
         message="Configuration updated",
         status=200,
     )
+
+
+def discover_cameras(rt, current_user):
+    """
+    Discover available cameras on the system and network
+    
+    Supports:
+    - USB cameras
+    - IP cameras (RTSP streams)
+    
+    Request body (optional):
+    {
+        "scan_network": true,  // Whether to scan for IP cameras
+        "ip_range": "192.168.1.1-50"  // Optional IP range (limited to 30 IPs)
+    }
+    
+    This endpoint now runs discovery in background and returns immediately.
+    Use the returned job_id to poll for results at /api/cameras/discover/<job_id>
+    """
+    del current_user
+    
+    data = rt.request.get_json(silent=True) or {}
+    scan_network = data.get('scan_network', True)
+    ip_range = data.get('ip_range')
+    
+    # Default to scanning only USB cameras first (faster)
+    if scan_network and not ip_range:
+        # Use limited IP range to prevent timeout
+        ip_range = '192.168.1.1-30'
+    
+    # Validate IP range if provided
+    if ip_range:
+        try:
+            # Try to parse the IP range
+            from cameras.camera_discovery import CameraDiscovery
+            test_ips = CameraDiscovery._parse_ip_range(ip_range)
+            if not test_ips:
+                return error_response("INVALID_IP_RANGE", "Invalid IP range format", 400)
+            # Limit to 30 IPs max
+            if len(test_ips) > 30:
+                ip_range = '192.168.1.1-30'
+        except Exception as e:
+            return error_response("INVALID_IP_RANGE", f"Invalid IP range: {str(e)}", 400)
+    
+    try:
+        from cameras.discovery_jobs import get_job_manager, run_discovery_in_background
+        
+        # Create a background job
+        job_manager = get_job_manager()
+        job = job_manager.create_job(scan_network=scan_network, ip_range=ip_range)
+        
+        rt.logger.info(f"Created discovery job {job.job_id} (scan_network={scan_network}, ip_range={ip_range})")
+        
+        # Start discovery in background thread
+        thread = threading.Thread(
+            target=run_discovery_in_background,
+            args=(job, ip_range, scan_network),
+            daemon=True
+        )
+        thread.start()
+        
+        # Return immediately with job ID
+        return success_response(
+            {
+                "job_id": job.job_id,
+                "status": job.status.value,
+                "message": "Discovery job started. Poll /api/cameras/discover/" + job.job_id + " for results."
+            },
+            message="Discovery started",
+            status=202,  # Accepted
+        )
+        
+    except Exception as e:
+        rt.logger.error(f"Camera discovery error: {e}")
+        return error_response("DISCOVERY_ERROR", f"Failed to start discovery: {str(e)}", 500)
+
+
+def get_discovery_result(rt, current_user, job_id):
+    """
+    Get the result of a background discovery job
+    
+    Path parameter:
+    - job_id: The job ID returned from POST /api/cameras/discover
+    
+    Returns:
+    - Job status and results if completed
+    - Job status if still running
+    """
+    del current_user
+    
+    if not job_id:
+        return error_response("MISSING_JOB_ID", "job_id is required", 400)
+    
+    try:
+        from cameras.discovery_jobs import get_job_manager
+        
+        job_manager = get_job_manager()
+        job = job_manager.get_job(job_id)
+        
+        if not job:
+            return error_response("JOB_NOT_FOUND", f"Job {job_id} not found", 404)
+        
+        # Build response
+        response_data = {
+            "job_id": job.job_id,
+            "status": job.status.value,
+        }
+        
+        if job.status.value == "completed":
+            response_data["discovered"] = job.result
+            response_data["message"] = f"Found {job.result['total']} cameras"
+            return success_response(response_data, message="Discovery completed", status=200)
+        elif job.status.value == "failed":
+            response_data["error"] = job.error
+            return error_response("DISCOVERY_FAILED", job.error, 500)
+        else:
+            # Still running or pending
+            response_data["message"] = "Discovery in progress..."
+            return success_response(response_data, message="Discovery in progress", status=200)
+            
+    except Exception as e:
+        rt.logger.error(f"Get discovery result error: {e}")
+        return error_response("GET_RESULT_ERROR", f"Failed to get result: {str(e)}", 500)

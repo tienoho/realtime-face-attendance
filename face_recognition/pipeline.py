@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class RecognitionResult:
     """Result of face recognition on a frame."""
-    student_id: Optional[str]
+    staff_id: Optional[str]
     name: Optional[str]
     confidence: float
     bbox: Tuple[int, int, int, int]
@@ -35,7 +35,7 @@ class RecognitionResult:
 @dataclass
 class AttendanceRecord:
     """Attendance record for a recognized face."""
-    student_id: str
+    staff_id: str
     name: str
     confidence: float
     camera_id: str
@@ -159,20 +159,20 @@ class FaceRecognitionPipeline:
             )
             
             if matches:
-                student_id, name, confidence = matches[0]
+                staff_id, name, confidence = matches[0]
                 is_recognized = True
                 
                 # Track attendance if enabled
                 if track_attendance:
-                    self._record_attendance(student_id, name, confidence, camera_id)
+                    self._record_attendance(staff_id, name, confidence, camera_id)
             else:
-                student_id = None
+                staff_id = None
                 name = None
                 confidence = 0.0
                 is_recognized = False
             
             results.append(RecognitionResult(
-                student_id=student_id,
+                staff_id=staff_id,
                 name=name,
                 confidence=confidence,
                 bbox=face.bbox,
@@ -197,10 +197,10 @@ class FaceRecognitionPipeline:
             return None
         
         # Record attendance
-        self._recent_attendance[student_id] = current_time
+        self._recent_attendance[staff_id] = current_time
         
         record = AttendanceRecord(
-            student_id=student_id,
+            staff_id=staff_id,
             name=name,
             confidence=confidence,
             camera_id=camera_id,
@@ -208,7 +208,7 @@ class FaceRecognitionPipeline:
         )
         
         logger.info(
-            f"Attendance recorded: {student_id} ({name}) "
+            f"Attendance recorded: {staff_id} ({name}) "
             f"confidence={confidence:.2f} camera={camera_id}"
         )
         
@@ -272,14 +272,14 @@ class FaceRecognitionPipeline:
         avg_embedding = np.mean(embeddings, axis=0)
         
         # Add to vector store
-        success = self.vector_store.add(student_id, name, avg_embedding)
+        success = self.vector_store.add(staff_id, name, avg_embedding)
         
         if success:
             return {
                 'success': True,
-                'message': f'Registered {student_id} with {len(embeddings)} images',
+                'message': f'Registered {staff_id} with {len(embeddings)} images',
                 'images_processed': len(embeddings),
-                'student_id': student_id,
+                'staff_id': staff_id,
                 'name': name
             }
         else:
@@ -288,9 +288,9 @@ class FaceRecognitionPipeline:
                 'message': 'Failed to add to vector store'
             }
     
-    def unregister_face(self, student_id: str) -> bool:
+    def unregister_face(self, staff_id: str) -> bool:
         """Remove a face from the system."""
-        return self.vector_store.delete(student_id)
+        return self.vector_store.delete(staff_id)
     
     def get_stats(self) -> Dict[str, Any]:
         """Get pipeline statistics."""

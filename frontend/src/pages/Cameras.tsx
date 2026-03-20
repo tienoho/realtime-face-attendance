@@ -19,6 +19,7 @@ import {
   InputLabel,
   Chip,
   CircularProgress,
+  Alert,
 } from '@mui/material'
 import {
   PlayArrow as PlayIcon,
@@ -26,8 +27,9 @@ import {
   Delete as DeleteIcon,
   Add as AddIcon,
   Videocam as VideocamIcon,
+  Search as SearchIcon,
 } from '@mui/icons-material'
-import { camerasApi, Camera, AddCameraRequest } from '../api/cameras'
+import { camerasApi, Camera, AddCameraRequest, DiscoveredCamera } from '../api/cameras'
 import { useSocket } from '../contexts/SocketContext'
 
 interface CameraCardProps {
@@ -117,6 +119,10 @@ function CameraCard({ camera, onStart, onStop, onDelete }: CameraCardProps) {
 
 export default function Cameras() {
   const [open, setOpen] = useState(false)
+  const [discoverOpen, setDiscoverOpen] = useState(false)
+  const [discoveredCameras, setDiscoveredCameras] = useState<DiscoveredCamera[]>([])
+  const [discovering, setDiscovering] = useState(false)
+  const [discoveryStatus, setDiscoveryStatus] = useState<string>('')
   const [cameraId, setCameraId] = useState('')
   const [cameraType, setCameraType] = useState<AddCameraRequest['type']>('usb')
   const [deviceIndex, setDeviceIndex] = useState(0)
@@ -165,6 +171,44 @@ export default function Cameras() {
     })
   }
 
+  const handleDiscover = async () => {
+    setDiscovering(true)
+    setDiscoveredCameras([])
+    setDiscoveryStatus('Starting discovery...')
+    try {
+      // Use polling to avoid timeout
+      const result = await camerasApi.discoverCamerasWithPolling(
+        { scan_network: true },
+        (status) => {
+          setDiscoveryStatus(`Scanning: ${status}...`)
+          console.log('Discovery status:', status)
+        },
+        60,  // max polls
+        2000 // poll every 2 seconds
+      )
+      const allCameras = [...(result.discovered?.usb || []), ...(result.discovered?.ip || [])]
+      setDiscoveredCameras(allCameras)
+      setDiscoveryStatus(`Found ${allCameras.length} cameras`)
+    } catch (error: any) {
+      console.error('Discover error:', error)
+      setDiscoveryStatus(`Error: ${error?.message || 'Unknown error'}`)
+    } finally {
+      setDiscovering(false)
+    }
+  }
+
+  const handleAddDiscoveredCamera = (camera: DiscoveredCamera) => {
+    setCameraId(camera.name.replace(/\s+/g, '_').toLowerCase())
+    if (camera.type === 'usb') {
+      setCameraType('usb')
+      setDeviceIndex(camera.device_index || 0)
+    } else {
+      setCameraType(camera.type as 'rtsp' | 'http' | 'onvif')
+    }
+    setDiscoverOpen(false)
+    setOpen(true)
+  }
+
   const cameras = data?.cameras ? Object.values(data.cameras) : []
 
   if (isLoading) {
@@ -181,13 +225,25 @@ export default function Cameras() {
         <Typography variant="h4" fontWeight={600}>
           Cameras
         </Typography>
-        <Button
-          variant="contained"
-          startIcon={<AddIcon />}
-          onClick={() => setOpen(true)}
-        >
-          Add Camera
-        </Button>
+        <Box sx={{ display: 'flex', gap: 2 }}>
+          <Button
+            variant="outlined"
+            startIcon={<SearchIcon />}
+            onClick={() => {
+              handleDiscover()
+              setDiscoverOpen(true)
+            }}
+          >
+            Discover
+          </Button>
+          <Button
+            variant="contained"
+            startIcon={<AddIcon />}
+            onClick={() => setOpen(true)}
+          >
+            Add Camera
+          </Button>
+        </Box>
       </Box>
 
       <Grid container spacing={3}>
@@ -254,6 +310,62 @@ export default function Cameras() {
             disabled={!cameraId || addCameraMutation.isPending}
           >
             {addCameraMutation.isPending ? <CircularProgress size={20} /> : 'Add'}
+          </Button>
+        </DialogActions>
+      </Dialog>
+
+      <Dialog open={discoverOpen} onClose={() => setDiscoverOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle>Discover Cameras</DialogTitle>
+        <DialogContent>
+          {discovering && (
+            <Box sx={{ display: 'flex', alignItems: 'center', gap: 2, mb: 2 }}>
+              <CircularProgress size={24} />
+              <Typography>{discoveryStatus || 'Scanning for cameras...'}</Typography>
+            </Box>
+          )}
+          
+          {!discovering && discoveredCameras.length === 0 && (
+            <Alert severity="info">
+              Click "Scan" to search for cameras on your network.
+            </Alert>
+          )}
+          
+          {!discovering && discoveredCameras.length > 0 && (
+            <Grid container spacing={2} sx={{ mt: 1 }}>
+              {discoveredCameras.map((camera, index) => (
+                <Grid item xs={12} sm={6} key={index}>
+                  <Card variant="outlined">
+                    <CardContent sx={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                      <Box>
+                        <Typography variant="subtitle1" fontWeight={600}>
+                          {camera.name}
+                        </Typography>
+                        <Typography variant="body2" color="text.secondary">
+                          Type: {camera.type} | {camera.url}
+                        </Typography>
+                      </Box>
+                      <Button
+                        size="small"
+                        variant="contained"
+                        onClick={() => handleAddDiscoveredCamera(camera)}
+                      >
+                        Add
+                      </Button>
+                    </CardContent>
+                  </Card>
+                </Grid>
+              ))}
+            </Grid>
+          )}
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setDiscoverOpen(false)}>Close</Button>
+          <Button
+            onClick={handleDiscover}
+            variant="contained"
+            disabled={discovering}
+          >
+            {discovering ? <CircularProgress size={20} /> : 'Scan'}
           </Button>
         </DialogActions>
       </Dialog>

@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FaceMatch:
     """Represents a face match result."""
-    student_id: str
+    staff_id: str
     name: str
     confidence: float
     distance: float

@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 @dataclass
 class FaceRecord:
     """Record for a face in the database."""
-    student_id: str
+    staff_id: str
     name: str
     embedding: np.ndarray
     created_at: str = ""
@@ -80,9 +80,9 @@ class VectorStore:
         self._next_id = 0
         
         # Metadata only (no embeddings duplication)
-        self._student_ids: Dict[int, str] = {}  # faiss_id -> student_id
-        self._student_names: Dict[str, str] = {}  # student_id -> name
-        self._faiss_id_map: Dict[str, int] = {}  # student_id -> faiss_id
+        self._staff_ids: Dict[int, str] = {}  # faiss_id -> staff_id
+        self._staff_names: Dict[str, str] = {}  # staff_id -> name
+        self._faiss_id_map: Dict[str, int] = {}  # staff_id -> faiss_id
         self._deleted_ids: Set[int] = set()
         
         self._load_index()
@@ -136,8 +136,8 @@ class VectorStore:
                 if os.path.exists(meta_path):
                     with open(meta_path, 'rb') as f:
                         data = pickle.load(f)
-                        self._student_ids = data.get('student_ids', {})
-                        self._student_names = data.get('student_names', {})
+                        self._staff_ids = data.get('staff_ids', {})
+                        self._staff_names = data.get('staff_names', {})
                         self._faiss_id_map = data.get('faiss_id_map', {})
                         self._next_id = data.get('next_id', 0)
                         self._deleted_ids = set(data.get('deleted_ids', []))
@@ -170,8 +170,8 @@ class VectorStore:
                 with self._meta_lock:
                     with open(meta_path, 'wb') as f:
                         pickle.dump({
-                            'student_ids': self._student_ids,
-                            'student_names': self._student_names,
+                            'staff_ids': self._staff_ids,
+                            'staff_names': self._staff_names,
                             'faiss_id_map': self._faiss_id_map,
                             'next_id': self._next_id,
                             'deleted_ids': list(self._deleted_ids)
@@ -182,7 +182,7 @@ class VectorStore:
             except Exception as e:
                 logger.error(f"Failed to save index: {e}")
     
-    def add(self, student_id: str, name: str, embedding: np.ndarray) -> bool:
+    def add(self, staff_id: str, name: str, embedding: np.ndarray) -> bool:
         """
         Add a face embedding to the store.
         C-RC-002 FIX: Thread-safe, no nested lock calls
@@ -198,11 +198,11 @@ class VectorStore:
             return False
         
         with self._meta_lock:
-            # Check if student_id already exists
-            if student_id in self._faiss_id_map:
-                logger.warning(f"Student {student_id} already exists. Updating.")
+            # Check if staff_id already exists
+            if staff_id in self._faiss_id_map:
+                logger.warning(f"Staff {staff_id} already exists. Updating.")
                 # C-RC-002 FIX: Inline update logic instead of calling update()
-                return self._update_internal(student_id, name, emb)
+                return self._update_internal(staff_id, name, emb)
         
         with self._index_lock:
             try:
@@ -218,26 +218,26 @@ class VectorStore:
                 
                 # Update metadata
                 with self._meta_lock:
-                    self._student_ids[faiss_id] = student_id
-                    self._student_names[student_id] = name
-                    self._faiss_id_map[student_id] = faiss_id
+                    self._staff_ids[faiss_id] = staff_id
+                    self._staff_names[staff_id] = name
+                    self._faiss_id_map[staff_id] = faiss_id
                 
                 # Schedule async save
                 self._schedule_save()
                 
-                logger.info(f"Added student {student_id} ({name}) to index")
+                logger.info(f"Added staff {staff_id} ({name}) to index")
                 return True
                 
             except Exception as e:
                 logger.error(f"Failed to add embedding: {e}")
                 return False
     
-    def _update_internal(self, student_id: str, name: str, embedding: np.ndarray) -> bool:
+    def _update_internal(self, staff_id: str, name: str, embedding: np.ndarray) -> bool:
         """
         Update an existing face embedding (internal, assumes meta_lock held).
         C-PERF-001 FIX: O(1) update with ID mapping instead of O(n) rebuild
         """
-        faiss_id = self._faiss_id_map.get(student_id)
+        faiss_id = self._faiss_id_map.get(staff_id)
         if faiss_id is None:
             return False
         
@@ -255,10 +255,10 @@ class VectorStore:
             )
         
         # Update metadata
-        del self._student_ids[faiss_id]
-        self._student_ids[new_faiss_id] = student_id
-        self._student_names[student_id] = name
-        self._faiss_id_map[student_id] = new_faiss_id
+        del self._staff_ids[faiss_id]
+        self._staff_ids[new_faiss_id] = staff_id
+        self._staff_names[staff_id] = name
+        self._faiss_id_map[staff_id] = new_faiss_id
         
         # Check if need to compact
         if len(self._deleted_ids) > len(self._faiss_id_map) * self.rebuild_threshold:
@@ -266,10 +266,10 @@ class VectorStore:
         else:
             self._schedule_save()
         
-        logger.info(f"Updated student {student_id}")
+        logger.info(f"Updated staff {staff_id}")
         return True
     
-    def update(self, student_id: str, name: str, embedding: np.ndarray) -> bool:
+    def update(self, staff_id: str, name: str, embedding: np.ndarray) -> bool:
         """
         Update an existing face embedding (public API).
         Thread-safe operation.
@@ -280,31 +280,31 @@ class VectorStore:
             return False
         
         with self._meta_lock:
-            if student_id not in self._faiss_id_map:
+            if staff_id not in self._faiss_id_map:
                 # Add new instead
-                return self.add(student_id, name, embedding)
-            return self._update_internal(student_id, name, emb)
+                return self.add(staff_id, name, embedding)
+            return self._update_internal(staff_id, name, emb)
     
-    def delete(self, student_id: str) -> bool:
+    def delete(self, staff_id: str) -> bool:
         """
         Delete a face embedding from the store.
         C-PERF-001 FIX: O(1) lazy deletion instead of O(n) rebuild
         """
         with self._meta_lock:
-            if student_id not in self._faiss_id_map:
-                logger.warning(f"Student {student_id} not found")
+            if staff_id not in self._faiss_id_map:
+                logger.warning(f"Staff {staff_id} not found")
                 return False
             
-            faiss_id = self._faiss_id_map[student_id]
+            faiss_id = self._faiss_id_map[staff_id]
             
             # Lazy deletion - mark as deleted
             self._deleted_ids.add(faiss_id)
             
             # Remove from metadata
-            del self._faiss_id_map[student_id]
-            del self._student_names[student_id]
-            if faiss_id in self._student_ids:
-                del self._student_ids[faiss_id]
+            del self._faiss_id_map[staff_id]
+            del self._staff_names[staff_id]
+            if faiss_id in self._staff_ids:
+                del self._staff_ids[faiss_id]
             
             # Check if need to compact
             if len(self._deleted_ids) > len(self._faiss_id_map) * self.rebuild_threshold:
@@ -312,7 +312,7 @@ class VectorStore:
             else:
                 self._schedule_save()
             
-            logger.info(f"Deleted student {student_id}")
+            logger.info(f"Deleted staff {staff_id}")
             return True
     
     def _compact_index(self):
@@ -380,15 +380,15 @@ class VectorStore:
                             continue
                         if idx in self._deleted_ids:
                             continue
-                        if idx not in self._student_ids:
+                        if idx not in self._staff_ids:
                             continue
                         
-                        student_id = self._student_ids[idx]
-                        name = self._student_names.get(student_id, "")
+                        staff_id = self._staff_ids[idx]
+                        name = self._staff_names.get(staff_id, "")
                         
                         # Apply threshold
                         if dist >= threshold:
-                            results.append((student_id, name, float(dist)))
+                            results.append((staff_id, name, float(dist)))
                         else:
                             break
                         
@@ -418,8 +418,8 @@ class VectorStore:
         """Clear all embeddings."""
         with self._index_lock, self._meta_lock:
             self._index.reset()
-            self._student_ids = {}
-            self._student_names = {}
+            self._staff_ids = {}
+            self._staff_names = {}
             self._faiss_id_map = {}
             self._deleted_ids = set()
             self._next_id = 0

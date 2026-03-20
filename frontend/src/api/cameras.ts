@@ -42,6 +42,42 @@ export interface StreamingConfig {
   resize_width: number
 }
 
+export interface DiscoveredCamera {
+  type: string
+  name: string
+  url: string
+  ip?: string
+  port?: number
+  protocol: string
+  device_index?: number
+}
+
+export interface DiscoverCamerasRequest {
+  scan_network?: boolean
+  ip_range?: string
+}
+
+export interface DiscoverCamerasResponse {
+  discovered?: {
+    usb: DiscoveredCamera[]
+    ip: DiscoveredCamera[]
+    total: number
+  }
+  message: string
+}
+
+export interface DiscoverJobResponse {
+  job_id: string
+  status: 'pending' | 'running' | 'completed' | 'failed'
+  discovered?: {
+    usb: DiscoveredCamera[]
+    ip: DiscoveredCamera[]
+    total: number
+  }
+  error?: string
+  message: string
+}
+
 export const camerasApi = {
   getCameras: async (): Promise<CameraStatus> => {
     const response = await api.get<ApiEnvelope<CameraStatus>>('/cameras')
@@ -83,5 +119,51 @@ export const camerasApi = {
   updateStreamingConfig: async (config: Partial<StreamingConfig>): Promise<StreamingConfig> => {
     const response = await api.post<ApiEnvelope<StreamingConfig>>('/streaming/config', config)
     return unwrapEnvelope(response.data)
+  },
+
+  discoverCameras: async (request?: DiscoverCamerasRequest): Promise<DiscoverCamerasResponse> => {
+    const response = await api.post<ApiEnvelope<DiscoverCamerasResponse>>('/cameras/discover', request || {})
+    return unwrapEnvelope(response.data)
+  },
+
+  // Start discovery and poll for results
+  discoverCamerasWithPolling: async (
+    request?: DiscoverCamerasRequest,
+    onProgress?: (status: string) => void,
+    maxPolls: number = 60,
+    pollIntervalMs: number = 2000
+  ): Promise<DiscoverCamerasResponse> => {
+    // Start discovery job
+    const startResponse = await api.post<ApiEnvelope<DiscoverJobResponse>>('/cameras/discover', request || {})
+    const startData = unwrapEnvelope(startResponse.data)
+    
+    const jobId = startData.job_id
+    onProgress?.('starting')
+    
+    // Poll for results
+    for (let i = 0; i < maxPolls; i++) {
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs))
+      
+      try {
+        const statusResponse = await api.get<ApiEnvelope<DiscoverJobResponse>>(`/cameras/discover/${jobId}`)
+        const statusData = unwrapEnvelope(statusResponse.data)
+        
+        if (statusData.status === 'completed') {
+          onProgress?.('completed')
+          return {
+            discovered: statusData.discovered || { usb: [], ip: [], total: 0 },
+            message: statusData.message || 'Discovery completed'
+          }
+        } else if (statusData.status === 'failed') {
+          throw new Error(statusData.error || 'Discovery failed')
+        } else {
+          onProgress?.(statusData.status)
+        }
+      } catch (error) {
+        console.error('Polling error:', error)
+      }
+    }
+    
+    throw new Error('Discovery timeout')
   },
 }

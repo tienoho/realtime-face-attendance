@@ -2,7 +2,7 @@ import api from './axios'
 import { ApiEnvelope, unwrapEnvelope, unwrapEnvelopeWithMessage } from './dto'
 
 export interface AttendanceRecord {
-  student_id: string
+  staff_id: string
   name: string
   date: string
   time: string
@@ -26,7 +26,7 @@ export interface MarkAttendanceRequest {
 export interface MarkAttendanceResponse {
   message: string
   status: string
-  student_id?: string
+  staff_id?: string
   name?: string
   subject?: string
   time?: string
@@ -50,7 +50,7 @@ export const attendanceApi = {
 
     const response = await api.post<ApiEnvelope<{
       status: string
-      student_id?: string
+      staff_id?: string
       name?: string
       subject?: string
       time?: string

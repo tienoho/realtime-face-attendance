@@ -76,4 +76,14 @@ def create_cameras_blueprint(runtime):
     def update_streaming_config_route(current_user):
         return camera_service.update_streaming_config(runtime, current_user)
 
+    @cameras_bp.route("/cameras/discover", methods=["POST"])
+    @runtime.token_required
+    def discover_cameras_route(current_user):
+        return camera_service.discover_cameras(runtime, current_user)
+
+    @cameras_bp.route("/cameras/discover/<job_id>", methods=["GET"])
+    @runtime.token_required
+    def get_discovery_result_route(current_user, job_id):
+        return camera_service.get_discovery_result(runtime, current_user, job_id)
+
     return cameras_bp

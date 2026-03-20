@@ -1,6 +1,7 @@
 """Attendance service layer."""
 
 import psycopg2
+from datetime import datetime, timezone
 
 try:
     from deployment.services.dto_service import error_response, success_response
@@ -49,8 +50,8 @@ def mark_attendance(rt, current_user):
         x, y, w, h = face_boxes[0]
         face_roi = gray[y : y + h, x : x + w]
 
-        student_id, confidence = rt.recognize_face(face_roi)
-        if student_id is None or confidence >= 70:
+        staff_id, confidence = rt.recognize_face(face_roi)
+        if staff_id is None or confidence >= 70:
             payload = {
                 "status": "unknown",
                 "confidence": float(confidence) if confidence else None,
@@ -61,37 +62,37 @@ def mark_attendance(rt, current_user):
             cursor = conn.cursor()
 
             cursor.execute(
-                "SELECT student_id, name FROM students WHERE student_id = %s AND is_active = TRUE",
-                (student_id,),
+                "SELECT staff_id, name FROM staffs WHERE staff_id = %s AND is_active = TRUE",
+                (staff_id,),
             )
-            student = cursor.fetchone()
-            if not student:
+            staff = cursor.fetchone()
+            if not staff:
                 payload = {"status": "not_found"}
-                return success_response(payload, message="Student not found or inactive", status=200)
+                return success_response(payload, message="Staff not found or inactive", status=200)
 
             # C-ED-002 FIX: Use UTC timezone
-            today = rt.datetime.now(rt.timezone.utc).strftime("%Y-%m-%d")
+            today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             cursor.execute(
-                "SELECT id FROM attendance WHERE student_id = %s AND date = %s AND subject = %s",
-                (student_id, today, subject),
+                "SELECT id FROM attendance WHERE staff_id = %s AND date = %s AND subject = %s",
+                (staff_id, today, subject),
             )
             if cursor.fetchone():
                 payload = {
                     "status": "already_marked",
-                    "student_id": student[0],
-                    "name": student[1],
+                    "staff_id": staff[0],
+                    "name": staff[1],
                 }
                 return success_response(payload, message="Already marked attendance today", status=200)
 
-            now = rt.datetime.now(rt.timezone.utc)
+            now = datetime.now(timezone.utc)
             cursor.execute(
                 """INSERT INTO attendance
-                   (student_id, enrollment, name, date, time, subject, status, confidence_score)
+                   (staff_id, enrollment, name, date, time, subject, status, confidence_score)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
                 (
-                    student_id,
-                    student_id,
-                    student[1],
+                    staff_id,
+                    staff_id,
+                    staff[1],
                     now.strftime("%Y-%m-%d"),
                     now.strftime("%H:%M:%S"),
                     subject,
@@ -100,12 +101,12 @@ def mark_attendance(rt, current_user):
                 ),
             )
 
-            rt.logger.info(f"Attendance marked: {student[1]} ({student_id}) for {subject}")
+            rt.logger.info(f"Attendance marked: {staff[1]} ({staff_id}) for {subject}")
 
         payload = {
             "status": "success",
-            "student_id": student[0],
-            "name": student[1],
+            "staff_id": staff[0],
+            "name": staff[1],
             "subject": subject,
             "time": now.strftime("%H:%M:%S"),
             "confidence": float(confidence),
@@ -125,20 +126,20 @@ def get_attendance_report(rt, current_user):
 
     try:
         # C-ED-002 FIX: Use UTC timezone
-        date = rt.request.args.get("date", rt.datetime.now(rt.timezone.utc).strftime("%Y-%m-%d"))
+        date = rt.request.args.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         subject = rt.request.args.get("subject", None)
 
         with rt.get_db_connection() as conn:
             cursor = conn.cursor()
             if subject:
                 cursor.execute(
-                    """SELECT a.student_id, a.name, a.date, a.time, a.subject, a.status, a.confidence_score
+                    """SELECT a.staff_id, a.name, a.date, a.time, a.subject, a.status, a.confidence_score
                        FROM attendance a WHERE a.date = %s AND a.subject = %s ORDER BY a.time""",
                     (date, subject),
                 )
             else:
                 cursor.execute(
-                    """SELECT student_id, name, date, time, subject, status, confidence_score
+                    """SELECT staff_id, name, date, time, subject, status, confidence_score
                        FROM attendance WHERE date = %s ORDER BY time""",
                     (date,),
                 )
@@ -152,7 +153,7 @@ def get_attendance_report(rt, current_user):
                 "count": len(records),
                 "records": [
                     {
-                        "student_id": r[0],
+                        "staff_id": r[0],
                         "name": r[1],
                         "date": _to_string(r[2]),
                         "time": _to_string(r[3]),

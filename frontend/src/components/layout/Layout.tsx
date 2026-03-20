@@ -37,7 +37,7 @@ const drawerWidth = 260
 const menuItems = [
   { text: 'Dashboard', icon: <DashboardIcon />, path: '/dashboard' },
   { text: 'Cameras', icon: <VideocamIcon />, path: '/cameras' },
-  { text: 'Students', icon: <PeopleIcon />, path: '/students' },
+  { text: 'Staffs', icon: <PeopleIcon />, path: '/staffs' },
   { text: 'Reports', icon: <AssessmentIcon />, path: '/reports' },
   { text: 'Settings', icon: <SettingsIcon />, path: '/settings' },
 ]

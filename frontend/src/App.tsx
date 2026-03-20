@@ -5,7 +5,7 @@ import Layout from './components/layout/Layout'
 import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Cameras from './pages/Cameras'
-import Students from './pages/Students'
+import Staffs from './pages/Staffs'
 import Reports from './pages/Reports'
 import Settings from './pages/Settings'
 
@@ -49,7 +49,7 @@ function App() {
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="dashboard" element={<Dashboard />} />
         <Route path="cameras" element={<Cameras />} />
-        <Route path="students" element={<Students />} />
+        <Route path="staffs" element={<Staffs />} />
         <Route path="reports" element={<Reports />} />
         <Route path="settings" element={<Settings />} />
       </Route>
